@@ -123,15 +123,21 @@ async function carregarFuncionariosAtivos() {
 function indexarFolha(folha) {
   const porMatricula = new Map();
   const porNome = new Map(); // nome_norm -> [itens]
+  const porPrimeiro = new Map(); // 1º token -> [itens] (poda similaridade)
   for (const f of folha) {
     if (f.matricula) porMatricula.set(String(f.matricula).trim(), f);
     const nn = f.funcionario_norm || normalizarNome(f.funcionario);
     if (nn) {
       if (!porNome.has(nn)) porNome.set(nn, []);
       porNome.get(nn).push(f);
+      const prim = nn.split(' ')[0];
+      if (prim) {
+        if (!porPrimeiro.has(prim)) porPrimeiro.set(prim, []);
+        porPrimeiro.get(prim).push(f);
+      }
     }
   }
-  return { porMatricula, porNome, todos: folha };
+  return { porMatricula, porNome, porPrimeiro, todos: folha };
 }
 
 /**
@@ -171,7 +177,9 @@ function encontrarMatch(hr, idx) {
   // 4) Nome muito similar + admissão (ex.: abreviação / ordem)
   const admHr = normalizarDataISO(hr.data_admissao);
   const candidatos = [];
-  for (const f of idx.todos) {
+  const prim = nomeNorm.split(' ')[0];
+  const pool = (prim && idx.porPrimeiro.get(prim)) || idx.todos;
+  for (const f of pool) {
     const sim = similaridadeNome(hr.nome, f.funcionario);
     if (sim < 0.92) continue;
     const admF = normalizarDataISO(f.admissao);

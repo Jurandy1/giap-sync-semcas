@@ -25,6 +25,13 @@ const IDS = {
 };
 
 let browserInstance = null;
+let scrapesDesdeRestart = 0;
+
+/** Reinicia o Chrome a cada N scrapes (Render free = 512MB). */
+const BROWSER_RESTART_EVERY = Math.max(
+  1,
+  Number(process.env.GIAP_BROWSER_RESTART_EVERY || 4)
+);
 
 /** Caminhos comuns de Chrome/Chromium em Docker/Linux (fallback). */
 function resolverExecutablePath() {
@@ -45,10 +52,29 @@ function resolverExecutablePath() {
   return undefined; // deixa o Puppeteer usar o Chrome do cache dele
 }
 
+export async function closeBrowser() {
+  if (browserInstance) {
+    await browserInstance.close().catch(() => {});
+    browserInstance = null;
+  }
+  scrapesDesdeRestart = 0;
+  if (typeof global.gc === 'function') {
+    try {
+      global.gc();
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
 async function getBrowser() {
+  if (scrapesDesdeRestart >= BROWSER_RESTART_EVERY) {
+    console.log('[puppeteer] reiniciando browser (RAM) após', scrapesDesdeRestart, 'scrapes');
+    await closeBrowser();
+  }
+
   if (browserInstance) {
     try {
-      // Testa se ainda tá conectado
       await browserInstance.version();
       return browserInstance;
     } catch {
@@ -64,6 +90,15 @@ async function getBrowser() {
       '--disable-setuid-sandbox',
       '--disable-dev-shm-usage',
       '--disable-gpu',
+      '--disable-extensions',
+      '--disable-background-networking',
+      '--disable-default-apps',
+      '--disable-sync',
+      '--disable-translate',
+      '--mute-audio',
+      '--no-first-run',
+      '--metrics-recording-only',
+      '--js-flags=--max-old-space-size=128',
       // Em containers (Render/Railway) estes ajudam com pouca RAM.
       // No Windows local eles derrubam o frame ("Navigating frame was detached").
       ...(process.env.PUPPETEER_DOCKER === '1'
@@ -78,6 +113,7 @@ async function getBrowser() {
 
   try {
     browserInstance = await puppeteer.launch(launchOpts);
+    scrapesDesdeRestart = 0;
   } catch (e) {
     const msg = e?.message || String(e);
     if (msg.includes('Could not find Chrome') || msg.includes('Browser was not found')) {
@@ -91,6 +127,19 @@ async function getBrowser() {
     throw e;
   }
   return browserInstance;
+}
+
+/** Bloqueia imagem/fonte/mídia pra caber em 512MB. */
+async function prepararPaginaLeve(page) {
+  await page.setRequestInterception(true);
+  page.on('request', (req) => {
+    const tipo = req.resourceType();
+    if (tipo === 'image' || tipo === 'font' || tipo === 'media' || tipo === 'stylesheet') {
+      req.abort().catch(() => {});
+    } else {
+      req.continue().catch(() => {});
+    }
+  });
 }
 
 async function loadPortal(page, timeoutMs) {
@@ -115,9 +164,11 @@ export async function scrapeRemuneracoes({
 } = {}) {
   const browser = await getBrowser();
   const page = await browser.newPage();
-  
+  scrapesDesdeRestart++;
+
   try {
     await page.setDefaultTimeout(timeoutMs);
+    await prepararPaginaLeve(page);
     await loadPortal(page, timeoutMs);
     
     // Expande o accordion do /remuneracoes (costuma vir colapsado)
@@ -200,9 +251,11 @@ export async function scrapeOrgaos({
 } = {}) {
   const browser = await getBrowser();
   const page = await browser.newPage();
-  
+  scrapesDesdeRestart++;
+
   try {
     await page.setDefaultTimeout(timeoutMs);
+    await prepararPaginaLeve(page);
     await loadPortal(page, timeoutMs);
     
     // Troca instituição se necessário
@@ -260,9 +313,3 @@ function parseResult(raw) {
   }
 }
 
-export async function closeBrowser() {
-  if (browserInstance) {
-    await browserInstance.close().catch(() => {});
-    browserInstance = null;
-  }
-}

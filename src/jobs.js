@@ -10,6 +10,10 @@ import {
   listarBuscasNomeSemMatricula
 } from './rhsemcas.js';
 import { competenciaAtual } from './utils.js';
+import { closeBrowser } from './scraper.js';
+
+/** Limite de buscas por nome completo (Render free ~512MB). */
+const MAX_BUSCAS_NOME = Math.max(0, Number(process.env.GIAP_MAX_BUSCAS_NOME || 25));
 
 const running = new Map(); // jobId -> promise
 
@@ -89,7 +93,7 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao }) {
         codigoInstituicao: 1,
         competencia
       });
-      // GIAP limita a ~100 — completa com prefixos A–Z e depois nome completo dos sem matrícula
+      // GIAP limita a ~100 — completa com prefixos A–Z e depois nome completo (limitado)
       let extras = 0;
       const letras = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split('');
       for (let i = 0; i < letras.length; i++) {
@@ -110,11 +114,18 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao }) {
         });
       }
 
-      // Busca inteligente por nome completo (RH sem matrícula ainda fora da folha)
+      // Libera RAM do Chrome antes das buscas por nome
+      await closeBrowser();
+
       let extrasNomes = 0;
       let buscasNome = [];
+      let buscasPendentes = 0;
       try {
-        buscasNome = await listarBuscasNomeSemMatricula(competencia);
+        const todas = await listarBuscasNomeSemMatricula(competencia);
+        // Prioriza nomes longos (mais específicos) e corta no limite de RAM
+        todas.sort((a, b) => b.busca.split(' ').length - a.busca.split(' ').length);
+        buscasPendentes = Math.max(0, todas.length - MAX_BUSCAS_NOME);
+        buscasNome = todas.slice(0, MAX_BUSCAS_NOME);
       } catch (err) {
         console.warn('[jobs] listar buscas nome', err.message);
       }
@@ -144,12 +155,16 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao }) {
         }
       }
 
+      // Fecha Chrome antes do enriquecimento (só Node + Supabase)
+      await closeBrowser();
+
       resumo.sync = {
         encontrados: syncRes.registros_encontrados,
         inseridos: syncRes.registros_inseridos,
         extras_letras: extras,
         extras_nomes: extrasNomes,
         buscas_nome: buscasNome.length,
+        buscas_nome_pendentes: buscasPendentes,
         success: syncRes.success
       };
       await updateJob(jobId, { progresso_pct: 30, resumo: { ...resumo, etapa: 'sync_ok' } });
@@ -242,6 +257,7 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao }) {
       resumo
     });
   } finally {
+    await closeBrowser().catch(() => {});
     running.delete(jobId);
   }
 }
