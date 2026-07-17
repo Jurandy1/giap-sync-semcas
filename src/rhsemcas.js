@@ -460,6 +460,7 @@ export async function listarBuscasNomeSemMatricula(competencia) {
 
 /**
  * Exoneração automática (demissao) + fila de revisão (ausência).
+ * Otimizado p/ Render 512MB: progresso throttled + inserts em lote.
  */
 export async function aplicarExoneracoes({
   competencia,
@@ -488,15 +489,23 @@ export async function aplicarExoneracoes({
 
   const total = comMatricula.length;
   let processados = 0;
+  let lastPctReport = -1;
+  const batchItems = [];
+  const MAX_ITEMS_SAMPLE = 40; // não estoura memória / DB no dry-run
+
+  async function flushItems() {
+    if (!jobId || !batchItems.length) return;
+    const chunk = batchItems.splice(0, batchItems.length);
+    const { error: errIns } = await sb().from('giap_job_items').insert(chunk);
+    if (errIns) console.warn('[exo] insert items', errIns.message);
+  }
 
   for (const hr of comMatricula) {
     processados++;
-    if (onProgress) {
-      await onProgress({
-        processados,
-        total,
-        pct: total ? Math.round((processados / total) * 1000) / 10 : 100
-      });
+    const pct = total ? Math.round((processados / total) * 1000) / 10 : 100;
+    if (onProgress && (pct - lastPctReport >= 2 || processados === total)) {
+      lastPctReport = pct;
+      await onProgress({ processados, total, pct });
     }
 
     const mat = String(hr.matricula).trim();
@@ -524,7 +533,6 @@ export async function aplicarExoneracoes({
           item.erro = errRpc.message;
         } else {
           relatorio.exonerados++;
-          // Resolve revisões pendentes se houver
           await sb()
             .from('giap_revisao_ausencia')
             .update({ status: 'exonerado', resolved_at: new Date().toISOString() })
@@ -535,9 +543,9 @@ export async function aplicarExoneracoes({
         relatorio.exonerados++;
       }
 
-      relatorio.items.push(item);
+      if (relatorio.items.length < MAX_ITEMS_SAMPLE) relatorio.items.push(item);
       if (jobId) {
-        await sb().from('giap_job_items').insert({
+        batchItems.push({
           job_id: jobId,
           funcionario_id: item.funcionario_id,
           matricula: item.matricula,
@@ -549,6 +557,7 @@ export async function aplicarExoneracoes({
           erro: item.erro || null
         });
       }
+      if (batchItems.length >= 50) await flushItems();
       continue;
     }
 
@@ -564,7 +573,7 @@ export async function aplicarExoneracoes({
         after_data: { competencia, motivo: 'ausente_folha_sem_demissao' },
         status: 'revisao'
       };
-      relatorio.items.push(item);
+      if (relatorio.items.length < MAX_ITEMS_SAMPLE) relatorio.items.push(item);
 
       if (!dryRun) {
         await sb().from('giap_revisao_ausencia').upsert(
@@ -580,8 +589,9 @@ export async function aplicarExoneracoes({
         );
       }
 
-      if (jobId) {
-        await sb().from('giap_job_items').insert({
+      // Dry-run: só amostra no log (centenas de inserts matavam o Render)
+      if (jobId && (!dryRun || relatorio.revisao_ausencia <= MAX_ITEMS_SAMPLE)) {
+        batchItems.push({
           job_id: jobId,
           funcionario_id: item.funcionario_id,
           matricula: item.matricula,
@@ -592,9 +602,11 @@ export async function aplicarExoneracoes({
           status: item.status
         });
       }
+      if (batchItems.length >= 50) await flushItems();
     }
   }
 
+  await flushItems();
   return relatorio;
 }
 

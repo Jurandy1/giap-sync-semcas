@@ -39,6 +39,16 @@ export async function criarEExecutarJob({
 } = {}) {
   const comp = Number(competencia || competenciaAtual());
 
+  // Jobs órfãos (Render OOM/restart) ficam "running" — cancela ao iniciar outro
+  await sb()
+    .from('giap_jobs')
+    .update({
+      status: 'error',
+      erro: 'Interrompido ou substituído por novo job (serviço reiniciou/OOM).',
+      finished_at: new Date().toISOString()
+    })
+    .in('status', ['pending', 'running']);
+
   const { data: job, error } = await sb()
     .from('giap_jobs')
     .insert({
@@ -132,11 +142,12 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao }) {
       for (let i = 0; i < buscasNome.length; i++) {
         const item = buscasNome[i];
         try {
+          // Sem codigoOrgao: o portal encontra o servidor mesmo se o filtro de órgão falhar
           const r = await syncPorNome({
             nomeServidor: item.busca,
             codigoInstituicao: 1,
             competencia,
-            codigoOrgao: String(codigoOrgao)
+            codigoOrgao: ''
           });
           extrasNomes += r.registros_inseridos || 0;
         } catch (err) {
@@ -185,11 +196,14 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao }) {
     // 2) Enriquecer
     if (tipo === 'ciclo_completo' || tipo === 'enriquecer') {
       await setProgress(30, 0, 'enriquecer');
+      let lastEnrichPct = -1;
       const enrich = await enriquecerFuncionarios({
         competencia,
         dryRun,
         jobId,
         onProgress: async ({ processados, total, pct }) => {
+          if (pct - lastEnrichPct < 2 && processados < total) return;
+          lastEnrichPct = pct;
           await updateJob(jobId, {
             processados,
             total,
