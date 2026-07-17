@@ -29,6 +29,44 @@ export function normalizarNome(nome) {
     .trim();
 }
 
+/** Tokens do nome (palavras), já normalizados. */
+export function tokensNome(nome) {
+  const n = normalizarNome(nome);
+  if (!n) return [];
+  return n.split(' ').filter(Boolean);
+}
+
+/**
+ * Similaridade de nomes (0–1) por tokens em comum.
+ * Exige que o menor nome tenha quase todos os tokens no maior
+ * (evita casar "JOAO" com "JOAO PEDRO SILVA" sem mais evidência).
+ */
+export function similaridadeNome(a, b) {
+  const ta = tokensNome(a);
+  const tb = tokensNome(b);
+  if (!ta.length || !tb.length) return 0;
+  const setB = new Set(tb);
+  const comuns = ta.filter((t) => setB.has(t)).length;
+  const menor = Math.min(ta.length, tb.length);
+  const maior = Math.max(ta.length, tb.length);
+  if (menor === 0) return 0;
+  // Cobertura do menor + leve peso do tamanho
+  const cobertura = comuns / menor;
+  const tamanho = menor / maior;
+  return cobertura * 0.85 + tamanho * 0.15;
+}
+
+/**
+ * Nome "forte" para busca no GIAP: usa o nome completo.
+ * Se tiver mais de 4 tokens, manda os 4 primeiros (limite prático do portal).
+ */
+export function nomeBuscaGiap(nome) {
+  const tokens = tokensNome(nome);
+  if (!tokens.length) return null;
+  if (tokens.length <= 4) return tokens.join(' ');
+  return tokens.slice(0, 4).join(' ');
+}
+
 /**
  * Converte data no formato DD-MM-YYYY (GIAP) pra ISO YYYY-MM-DD (Postgres).
  */

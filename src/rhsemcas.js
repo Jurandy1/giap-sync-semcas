@@ -1,15 +1,15 @@
 /**
  * Adaptador RHSEMCAS: enriquecimento + exoneração a partir da folha GIAP.
  *
- * Regras:
- * - matrícula: só se vazia
- * - nome: corrige com match confiável
- * - data_admissao: só se vazia
- * - vínculo: só se cargoorigem = SERVICO PRESTADO e RH for outro
- * - exoneração: só se demissao preenchida
- * - ausência sem demissão: fila giap_revisao_ausencia
+ * Matching (API GIAP NÃO usa CPF como chave principal):
+ * 1) matrícula
+ * 2) nome completo (exato)
+ * 3) nome completo + data de admissão (desambiguação)
+ * 4) nome muito similar + data de admissão
+ *
+ * Enriquecimento: preenche matrícula/admissão/nome quando o match é confiável.
  */
-import { normalizarCPF, normalizarNome } from './utils.js';
+import { normalizarNome, similaridadeNome, nomeBuscaGiap } from './utils.js';
 import { getSupabase } from './supabase.js';
 
 const CODIGO_ORGAO_SEMCAS = process.env.GIAP_CODIGO_ORGAO || '9';
@@ -18,6 +18,8 @@ const LOTACAO_SEMCAS = 'SEMCAS';
 function sb() {
   return getSupabase();
 }
+
+export { nomeBuscaGiap };
 
 function cargoEhServicoPrestado(cargo) {
   if (!cargo) return false;
@@ -45,7 +47,7 @@ function normalizarDataISO(d) {
 /**
  * Confere admissão RH × GIAP.
  * - Se o RH tem data: GIAP precisa ter a mesma (obrigatório).
- * - Se o RH não tem: retorna 'sem_rh' (só permite preencher admissão; sem nome/vínculo/matrícula).
+ * - Se o RH não tem: 'sem_rh' — ainda permite preencher matrícula/admissão em match por nome.
  */
 function statusAdmissao(hrAdmissao, folhaAdmissao) {
   const a = normalizarDataISO(hrAdmissao);
@@ -56,6 +58,15 @@ function statusAdmissao(hrAdmissao, folhaAdmissao) {
   }
   return 'sem_rh';
 }
+
+/** Match tipagens que autorizam preencher matrícula/admissão vazias. */
+const TIPOS_ENRIQUECER = new Set([
+  'matricula',
+  'nome_exato',
+  'nome_admissao',
+  'nome_similar_admissao',
+  'nome_similar'
+]);
 
 async function carregarFolhaSemcas(competencia) {
   const { data, error } = await sb()
@@ -110,35 +121,99 @@ async function carregarFuncionariosAtivos() {
 }
 
 function indexarFolha(folha) {
-  const porCPF = new Map();
   const porMatricula = new Map();
-  const porNome = new Map();
+  const porNome = new Map(); // nome_norm -> [itens]
   for (const f of folha) {
-    if (f.cpf) porCPF.set(f.cpf, f);
-    if (f.matricula) porMatricula.set(String(f.matricula), f);
-    if (f.funcionario_norm) {
-      if (!porNome.has(f.funcionario_norm)) porNome.set(f.funcionario_norm, []);
-      porNome.get(f.funcionario_norm).push(f);
+    if (f.matricula) porMatricula.set(String(f.matricula).trim(), f);
+    const nn = f.funcionario_norm || normalizarNome(f.funcionario);
+    if (nn) {
+      if (!porNome.has(nn)) porNome.set(nn, []);
+      porNome.get(nn).push(f);
     }
   }
-  return { porCPF, porMatricula, porNome };
+  return { porMatricula, porNome, todos: folha };
 }
 
+/**
+ * Match inteligente — sem CPF (portal/API não é fonte confiável de CPF aqui).
+ * Prioridade: matrícula → nome exato → nome+admissão → nome similar+admissão.
+ */
 function encontrarMatch(hr, idx) {
-  const cpf = normalizarCPF(hr.cpf);
-  if (cpf && idx.porCPF.has(cpf)) {
-    return { match: idx.porCPF.get(cpf), tipo: 'cpf' };
+  // 1) Matrícula (mais forte)
+  if (!matriculaVazia(hr.matricula)) {
+    const m = idx.porMatricula.get(String(hr.matricula).trim());
+    if (m) return { match: m, tipo: 'matricula', confianca: 1 };
   }
-  if (!matriculaVazia(hr.matricula) && idx.porMatricula.has(String(hr.matricula).trim())) {
-    return { match: idx.porMatricula.get(String(hr.matricula).trim()), tipo: 'matricula' };
-  }
+
   const nomeNorm = normalizarNome(hr.nome);
-  if (nomeNorm) {
-    const cands = idx.porNome.get(nomeNorm) || [];
-    if (cands.length === 1) return { match: cands[0], tipo: 'nome' };
-    if (cands.length > 1) return { match: null, tipo: 'ambiguo', candidatos: cands.length };
+  if (!nomeNorm) return { match: null, tipo: 'sem_match', confianca: 0 };
+
+  // 2) Nome completo exatamente igual
+  const exatos = idx.porNome.get(nomeNorm) || [];
+  if (exatos.length === 1) {
+    return { match: exatos[0], tipo: 'nome_exato', confianca: 0.95 };
   }
-  return { match: null, tipo: 'sem_match' };
+  if (exatos.length > 1) {
+    // 3) Desambigua com data de admissão
+    const admHr = normalizarDataISO(hr.data_admissao);
+    if (admHr) {
+      const comAdm = exatos.filter((f) => normalizarDataISO(f.admissao) === admHr);
+      if (comAdm.length === 1) {
+        return { match: comAdm[0], tipo: 'nome_admissao', confianca: 0.98 };
+      }
+      if (comAdm.length > 1) {
+        return { match: null, tipo: 'ambiguo', candidatos: comAdm.length, confianca: 0 };
+      }
+    }
+    return { match: null, tipo: 'ambiguo', candidatos: exatos.length, confianca: 0 };
+  }
+
+  // 4) Nome muito similar + admissão (ex.: abreviação / ordem)
+  const admHr = normalizarDataISO(hr.data_admissao);
+  const candidatos = [];
+  for (const f of idx.todos) {
+    const sim = similaridadeNome(hr.nome, f.funcionario);
+    if (sim < 0.92) continue;
+    const admF = normalizarDataISO(f.admissao);
+    // Sem admissão no RH: só aceita similaridade quase perfeita e nome com ≥3 tokens
+    if (!admHr) {
+      if (sim >= 0.98 && tokensLen(hr.nome) >= 3) {
+        candidatos.push({ f, sim, comAdm: false });
+      }
+      continue;
+    }
+    if (admF && admF === admHr) {
+      candidatos.push({ f, sim, comAdm: true });
+    }
+  }
+
+  if (candidatos.length === 1) {
+    const c = candidatos[0];
+    return {
+      match: c.f,
+      tipo: c.comAdm ? 'nome_similar_admissao' : 'nome_similar',
+      confianca: c.sim
+    };
+  }
+  if (candidatos.length > 1) {
+    // Empate: pega o de maior similaridade se for único no topo
+    candidatos.sort((a, b) => b.sim - a.sim);
+    if (candidatos[0].sim - candidatos[1].sim >= 0.03) {
+      const c = candidatos[0];
+      return {
+        match: c.f,
+        tipo: c.comAdm ? 'nome_similar_admissao' : 'nome_similar',
+        confianca: c.sim
+      };
+    }
+    return { match: null, tipo: 'ambiguo', candidatos: candidatos.length, confianca: 0 };
+  }
+
+  return { match: null, tipo: 'sem_match', confianca: 0 };
+}
+
+function tokensLen(nome) {
+  return (normalizarNome(nome) || '').split(' ').filter(Boolean).length;
 }
 
 /**
@@ -227,6 +302,8 @@ export async function enriquecerFuncionarios({
     }
 
     relatorio.matched++;
+    if (!TIPOS_ENRIQUECER.has(tipo)) continue;
+
     const patchFunc = {};
     const before = {
       nome: hr.nome,
@@ -235,32 +312,32 @@ export async function enriquecerFuncionarios({
     };
     const acoes = [];
 
-    // RH sem admissão: só preenche a data — não altera nome/matrícula/vínculo
-    // (lotação NUNCA é alterada pela API; só vínculo SP quando admissão confere)
-    if (adm === 'sem_rh') {
-      if (match.admissao) {
-        patchFunc.data_admissao = match.admissao;
-        acoes.push('admissao');
-        relatorio.admissao_preenchida++;
-      }
-    } else {
-      // adm === 'ok' — admissão bate: pode enriquecer demais campos
-      if (matriculaVazia(hr.matricula) && match.matricula) {
-        patchFunc.matricula = String(match.matricula);
-        acoes.push('matricula');
-        relatorio.matricula_preenchida++;
-      }
-
-      if (match.funcionario && normalizarNome(hr.nome) !== normalizarNome(match.funcionario)) {
-        if (tipo === 'cpf' || tipo === 'matricula') {
-          patchFunc.nome = match.funcionario;
-          acoes.push('nome');
-          relatorio.nome_corrigido++;
-        }
-      }
+    // Matrícula vazia + match confiável (nome/matrícula) → preenche
+    if (matriculaVazia(hr.matricula) && match.matricula) {
+      patchFunc.matricula = String(match.matricula);
+      acoes.push('matricula');
+      relatorio.matricula_preenchida++;
     }
 
-    // Vínculo SP: só corrige categoria do vínculo — NUNCA lotacao_id / unidade
+    // Admissão vazia no RH → preenche com GIAP
+    if (adm === 'sem_rh' && match.admissao) {
+      patchFunc.data_admissao = match.admissao;
+      acoes.push('admissao');
+      relatorio.admissao_preenchida++;
+    }
+
+    // Nome: só corrige quando a chave foi matrícula (GIAP é fonte do nome)
+    if (
+      tipo === 'matricula' &&
+      match.funcionario &&
+      normalizarNome(hr.nome) !== normalizarNome(match.funcionario)
+    ) {
+      patchFunc.nome = match.funcionario;
+      acoes.push('nome');
+      relatorio.nome_corrigido++;
+    }
+
+    // Vínculo SP: só quando admissão confere — NUNCA lotacao_id / unidade
     let vinculoPatch = null;
     if (adm === 'ok') {
       const lot = lotByFunc.get(hr.id);
@@ -333,6 +410,44 @@ export async function enriquecerFuncionarios({
   }
 
   return relatorio;
+}
+
+/**
+ * Nomes completos (busca GIAP) de ativos sem matrícula que ainda não estão na folha.
+ * Evita reconsultar quem já foi puxado por órgão/letra.
+ */
+export async function listarBuscasNomeSemMatricula(competencia) {
+  const folha = await carregarFolhaSemcas(competencia);
+  const nomesFolha = new Set(
+    folha.map((f) => normalizarNome(f.funcionario)).filter(Boolean)
+  );
+
+  const { data: funcs, error } = await sb()
+    .from('funcionarios')
+    .select('id, nome, matricula, data_admissao')
+    .eq('ativo', true);
+  if (error) throw error;
+
+  const buscas = [];
+  const vistos = new Set();
+  for (const hr of funcs || []) {
+    if (!matriculaVazia(hr.matricula)) continue;
+
+    const nn = normalizarNome(hr.nome);
+    if (!nn || nomesFolha.has(nn)) continue;
+    if (tokensLen(hr.nome) < 2) continue;
+
+    const busca = nomeBuscaGiap(hr.nome);
+    if (!busca || vistos.has(busca)) continue;
+    vistos.add(busca);
+    buscas.push({
+      funcionario_id: hr.id,
+      nome: hr.nome,
+      busca,
+      data_admissao: hr.data_admissao
+    });
+  }
+  return buscas;
 }
 
 /**

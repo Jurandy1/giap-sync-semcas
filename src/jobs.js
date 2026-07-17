@@ -6,7 +6,8 @@ import {
   enriquecerFuncionarios,
   aplicarExoneracoes,
   CODIGO_ORGAO_SEMCAS,
-  getSupabase
+  getSupabase,
+  listarBuscasNomeSemMatricula
 } from './rhsemcas.js';
 import { competenciaAtual } from './utils.js';
 
@@ -88,7 +89,7 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao }) {
         codigoInstituicao: 1,
         competencia
       });
-      // GIAP limita a 100 — completa com prefixos A–Z / nomes do RH sem matrícula na folha
+      // GIAP limita a ~100 — completa com prefixos A–Z e depois nome completo dos sem matrícula
       let extras = 0;
       const letras = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split('');
       for (let i = 0; i < letras.length; i++) {
@@ -104,14 +105,51 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao }) {
           console.warn('[jobs] sync letra', letras[i], err.message);
         }
         await updateJob(jobId, {
-          progresso_pct: Math.round(5 + ((i + 1) / letras.length) * 25),
+          progresso_pct: Math.round(5 + ((i + 1) / letras.length) * 15),
           resumo: { ...resumo, etapa: `sync_letra_${letras[i]}` }
         });
       }
+
+      // Busca inteligente por nome completo (RH sem matrícula ainda fora da folha)
+      let extrasNomes = 0;
+      let buscasNome = [];
+      try {
+        buscasNome = await listarBuscasNomeSemMatricula(competencia);
+      } catch (err) {
+        console.warn('[jobs] listar buscas nome', err.message);
+      }
+      for (let i = 0; i < buscasNome.length; i++) {
+        const item = buscasNome[i];
+        try {
+          const r = await syncPorNome({
+            nomeServidor: item.busca,
+            codigoInstituicao: 1,
+            competencia,
+            codigoOrgao: String(codigoOrgao)
+          });
+          extrasNomes += r.registros_inseridos || 0;
+        } catch (err) {
+          console.warn('[jobs] sync nome', item.busca, err.message);
+        }
+        if (i % 5 === 0 || i === buscasNome.length - 1) {
+          await updateJob(jobId, {
+            progresso_pct: Math.round(
+              20 + ((i + 1) / Math.max(buscasNome.length, 1)) * 10
+            ),
+            resumo: {
+              ...resumo,
+              etapa: `sync_nome_${i + 1}/${buscasNome.length}`
+            }
+          });
+        }
+      }
+
       resumo.sync = {
         encontrados: syncRes.registros_encontrados,
         inseridos: syncRes.registros_inseridos,
         extras_letras: extras,
+        extras_nomes: extrasNomes,
+        buscas_nome: buscasNome.length,
         success: syncRes.success
       };
       await updateJob(jobId, { progresso_pct: 30, resumo: { ...resumo, etapa: 'sync_ok' } });
@@ -119,8 +157,8 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao }) {
         await updateJob(jobId, {
           status: 'done',
           progresso_pct: 100,
-          processados: (syncRes.registros_encontrados || 0) + extras,
-          total: (syncRes.registros_encontrados || 0) + extras,
+          processados: (syncRes.registros_encontrados || 0) + extras + extrasNomes,
+          total: (syncRes.registros_encontrados || 0) + extras + extrasNomes,
           finished_at: new Date().toISOString(),
           resumo
         });
