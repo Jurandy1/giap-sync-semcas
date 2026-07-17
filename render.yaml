@@ -1,0 +1,15 @@
+# Força o Render a usar Docker (imagem oficial do Puppeteer com Chrome).
+# Sem isso, o deploy Node nativo sobe sem o Chrome e o job falha.
+services:
+  - type: web
+    name: giap-sync-semcas
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: PUPPETEER_DOCKER
+        value: "1"
+      - key: NODE_ENV
+        value: production
+      # API_KEY, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY: cadastre no Dashboard

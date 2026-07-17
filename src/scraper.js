@@ -1,4 +1,5 @@
 import puppeteer from 'puppeteer';
+import fs from 'fs';
 
 const PORTAL_URL = 'https://saoluis.giap.com.br/ords/saoluis/f?p=1618:6';
 
@@ -25,6 +26,25 @@ const IDS = {
 
 let browserInstance = null;
 
+/** Caminhos comuns de Chrome/Chromium em Docker/Linux (fallback). */
+function resolverExecutablePath() {
+  if (process.env.PUPPETEER_EXECUTABLE_PATH) {
+    return process.env.PUPPETEER_EXECUTABLE_PATH;
+  }
+  const candidatos = [
+    '/usr/bin/google-chrome-stable',
+    '/usr/bin/google-chrome',
+    '/usr/bin/chromium',
+    '/usr/bin/chromium-browser',
+  ];
+  for (const p of candidatos) {
+    try {
+      if (fs.existsSync(p)) return p;
+    } catch { /* ignore */ }
+  }
+  return undefined; // deixa o Puppeteer usar o Chrome do cache dele
+}
+
 async function getBrowser() {
   if (browserInstance) {
     try {
@@ -35,20 +55,41 @@ async function getBrowser() {
       browserInstance = null;
     }
   }
-  browserInstance = await puppeteer.launch({
+
+  const executablePath = resolverExecutablePath();
+  const launchOpts = {
     headless: 'new',
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
       '--disable-dev-shm-usage',
       '--disable-gpu',
-      // Em containers (Railway) estes ajudam com pouca RAM.
+      // Em containers (Render/Railway) estes ajudam com pouca RAM.
       // No Windows local eles derrubam o frame ("Navigating frame was detached").
       ...(process.env.PUPPETEER_DOCKER === '1'
         ? ['--single-process', '--no-zygote']
         : [])
     ]
-  });
+  };
+  if (executablePath) {
+    launchOpts.executablePath = executablePath;
+    console.log('[puppeteer] usando executablePath:', executablePath);
+  }
+
+  try {
+    browserInstance = await puppeteer.launch(launchOpts);
+  } catch (e) {
+    const msg = e?.message || String(e);
+    if (msg.includes('Could not find Chrome') || msg.includes('Browser was not found')) {
+      throw new Error(
+        msg +
+          '\n\nNo Render: use deploy via Docker (render.yaml / Dockerfile) ou ' +
+          'defina o Environment Runtime como Docker. ' +
+          'Build nativo Node não traz o Chrome automaticamente.'
+      );
+    }
+    throw e;
+  }
   return browserInstance;
 }
 
