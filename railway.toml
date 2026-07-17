@@ -1,0 +1,21 @@
+[build]
+builder = "DOCKERFILE"
+
+[deploy]
+startCommand = "node src/server.js"
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 3
+healthcheckPath = "/health"
+healthcheckTimeout = 30
+
+# Cron mensal: todo dia às 06:00 UTC o endpoint /cron/mensal
+# verifica se hoje == giap_config.dia_mes (default 27) e se automatico=true.
+# No Railway Dashboard → Cron Jobs, configure:
+#   Schedule: 0 6 27 * *
+#   Command ou HTTP: POST /cron/mensal com header X-API-Key
+#
+# Alternativa HTTP (Railway Cron HTTP):
+#   URL: https://SEU-SERVICO.up.railway.app/cron/mensal
+#   Method: POST
+#   Header: X-API-Key: <API_KEY>
+#   Schedule: 0 6 * * *   (diário; o próprio endpoint decide se é o dia 27)
