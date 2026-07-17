@@ -1,17 +1,9 @@
-import { createClient } from '@supabase/supabase-js';
 import { scrapeRemuneracoes } from './scraper.js';
 import { normalizarCPF, normalizarNome, parseDataBR } from './utils.js';
+import { getSupabase } from './supabase.js';
 
-let _sb = null;
 function sb() {
-  if (!_sb) {
-    _sb = createClient(
-      process.env.SUPABASE_URL,
-      process.env.SUPABASE_SERVICE_ROLE_KEY,
-      { auth: { persistSession: false } }
-    );
-  }
-  return _sb;
+  return getSupabase();
 }
 
 /**

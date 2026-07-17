@@ -9,22 +9,14 @@
  * - exoneração: só se demissao preenchida
  * - ausência sem demissão: fila giap_revisao_ausencia
  */
-import { createClient } from '@supabase/supabase-js';
 import { normalizarCPF, normalizarNome } from './utils.js';
+import { getSupabase } from './supabase.js';
 
 const CODIGO_ORGAO_SEMCAS = process.env.GIAP_CODIGO_ORGAO || '9';
 const LOTACAO_SEMCAS = 'SEMCAS';
 
-let _sb = null;
 function sb() {
-  if (!_sb) {
-    _sb = createClient(
-      process.env.SUPABASE_URL,
-      process.env.SUPABASE_SERVICE_ROLE_KEY,
-      { auth: { persistSession: false } }
-    );
-  }
-  return _sb;
+  return getSupabase();
 }
 
 function cargoEhServicoPrestado(cargo) {
@@ -483,4 +475,4 @@ export async function aplicarExoneracoes({
   return relatorio;
 }
 
-export { CODIGO_ORGAO_SEMCAS, sb as getSupabase };
+export { CODIGO_ORGAO_SEMCAS, getSupabase };
