@@ -47,11 +47,13 @@ const VINCULOS_FOLHA_PMSL = new Set(
  * folha e apenas poluem "sem_match" / "revisao_ausencia".
  */
 async function carregarIdsElegiveisFolhaPmsl() {
-  const { data: lots, error: errLot } = await sb()
-    .from('funcionario_lotacao')
-    .select('funcionario_id, vinculo_id, ativo, data_fim')
-    .eq('ativo', true);
-  if (errLot) throw errLot;
+  const lots = await selectTudo(() =>
+    sb()
+      .from('funcionario_lotacao')
+      .select('id, funcionario_id, vinculo_id, ativo, data_fim')
+      .eq('ativo', true)
+      .order('id')
+  );
 
   const { data: vinculos, error: errV } = await sb()
     .from('vinculos')
@@ -80,6 +82,22 @@ function ehFolhaSemcas(f) {
 
 function sb() {
   return getSupabase();
+}
+
+/**
+ * O Supabase corta em 1000 linhas por consulta — com 1165 ativos, o corte
+ * silencioso deixava ~165 servidores fora do enriquecimento/exoneração.
+ * Recebe uma fábrica de query (o builder não pode ser reutilizado entre ranges).
+ */
+async function selectTudo(montarQuery, pageSize = 1000) {
+  const out = [];
+  for (let from = 0; ; from += pageSize) {
+    const { data, error } = await montarQuery().range(from, from + pageSize - 1);
+    if (error) throw error;
+    if (data?.length) out.push(...data);
+    if (!data || data.length < pageSize) break;
+  }
+  return out;
 }
 
 export { nomeBuscaGiap, variantesBuscaGiap };
@@ -132,23 +150,21 @@ const TIPOS_ENRIQUECER = new Set([
 ]);
 
 async function carregarFolhaSemcas(competencia) {
-  const { data, error } = await sb()
-    .from('folha_pmsl')
-    .select('*')
-    .eq('competencia', competencia)
-    .or(`lotacao.eq.${LOTACAO_SEMCAS},codigo_orgao.eq.${CODIGO_ORGAO_SEMCAS}`);
-  if (error) throw error;
-  return data || [];
+  return selectTudo(() =>
+    sb()
+      .from('folha_pmsl')
+      .select('*')
+      .eq('competencia', competencia)
+      .or(`lotacao.eq.${LOTACAO_SEMCAS},codigo_orgao.eq.${CODIGO_ORGAO_SEMCAS}`)
+      .order('id')
+  );
 }
 
 /** Folha inteira da competência (inclui buscas por nome sem filtro de órgão). */
 async function carregarFolhaCompetencia(competencia) {
-  const { data, error } = await sb()
-    .from('folha_pmsl')
-    .select('*')
-    .eq('competencia', competencia);
-  if (error) throw error;
-  return data || [];
+  return selectTudo(() =>
+    sb().from('folha_pmsl').select('*').eq('competencia', competencia).order('id')
+  );
 }
 
 /** Prefere registro SEMCAS quando há homônimos. */
@@ -159,17 +175,21 @@ function preferirSemcas(lista) {
 }
 
 async function carregarFuncionariosAtivos() {
-  const { data: funcs, error } = await sb()
-    .from('funcionarios')
-    .select('id, nome, cpf, matricula, data_admissao, ativo')
-    .eq('ativo', true);
-  if (error) throw error;
+  const funcs = await selectTudo(() =>
+    sb()
+      .from('funcionarios')
+      .select('id, nome, cpf, matricula, data_admissao, ativo')
+      .eq('ativo', true)
+      .order('id')
+  );
 
-  const { data: lots, error: errLot } = await sb()
-    .from('funcionario_lotacao')
-    .select('id, funcionario_id, vinculo_id, ativo, data_fim')
-    .eq('ativo', true);
-  if (errLot) throw errLot;
+  const lots = await selectTudo(() =>
+    sb()
+      .from('funcionario_lotacao')
+      .select('id, funcionario_id, vinculo_id, ativo, data_fim')
+      .eq('ativo', true)
+      .order('id')
+  );
 
   const { data: vinculos, error: errV } = await sb()
     .from('vinculos')
@@ -530,11 +550,13 @@ export async function listarBuscasNomePendentes(competencia) {
 
   const idsElegiveis = await carregarIdsElegiveisFolhaPmsl();
 
-  const { data: funcs, error } = await sb()
-    .from('funcionarios')
-    .select('id, nome, matricula, data_admissao')
-    .eq('ativo', true);
-  if (error) throw error;
+  const funcs = await selectTudo(() =>
+    sb()
+      .from('funcionarios')
+      .select('id, nome, matricula, data_admissao')
+      .eq('ativo', true)
+      .order('id')
+  );
 
   const buscas = [];
   const vistosChave = new Set();
@@ -595,11 +617,13 @@ export async function aplicarExoneracoes({
   const minFolhaAusencia = Math.max(0, Number(process.env.GIAP_MIN_FOLHA_AUSENCIA || 300));
   const ausenciaHabilitada = folha.length >= minFolhaAusencia;
 
-  const { data: funcs, error } = await sb()
-    .from('funcionarios')
-    .select('id, nome, matricula, ativo')
-    .eq('ativo', true);
-  if (error) throw error;
+  const funcs = await selectTudo(() =>
+    sb()
+      .from('funcionarios')
+      .select('id, nome, matricula, ativo')
+      .eq('ativo', true)
+      .order('id')
+  );
 
   const idsElegiveis = await carregarIdsElegiveisFolhaPmsl();
   const comMatricula = (funcs || []).filter(

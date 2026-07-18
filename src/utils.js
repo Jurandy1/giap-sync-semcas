@@ -157,8 +157,35 @@ export function variantesBuscaGiap(nome) {
     add(`${alvoPU[0]} ${alvoPU[1]}`);
   }
 
+  // Último recurso: token mais raro sozinho. A busca do GIAP é substring
+  // (não só prefixo), então "THAYLLANNA" acha a servidora mesmo com o
+  // sobrenome abreviado/errado no RH. O filtro de similaridade pós-scrape
+  // segura os homônimos.
+  const raros = fundido.filter(
+    (t) =>
+      !particulas.has(t) &&
+      !SUFIXOS_IGNORADOS.has(t) &&
+      !NOMES_COMUNS.has(t) &&
+      t.length >= 5
+  );
+  if (raros.length) {
+    add(raros.reduce((a, b) => (b.length > a.length ? b : a)));
+  }
+
   return out;
 }
+
+/** Nomes/sobrenomes frequentes demais pra busca de token único. */
+const NOMES_COMUNS = new Set([
+  'MARIA', 'JOSE', 'JOAO', 'ANTONIO', 'ANTONIA', 'FRANCISCO', 'FRANCISCA',
+  'CARLOS', 'PAULO', 'PEDRO', 'LUCAS', 'MARCOS', 'RAIMUNDO', 'RAIMUNDA',
+  'MANOEL', 'MANUEL', 'FATIMA', 'LOURDES', 'CONCEICAO', 'APARECIDA',
+  'SILVA', 'SANTOS', 'SOUSA', 'SOUZA', 'OLIVEIRA', 'LIMA', 'COSTA',
+  'PEREIRA', 'FERREIRA', 'RODRIGUES', 'ALMEIDA', 'NASCIMENTO', 'ARAUJO',
+  'RIBEIRO', 'CARVALHO', 'GOMES', 'MARTINS', 'BARBOSA', 'ALVES', 'MORAES',
+  'MORAIS', 'CASTRO', 'ANDRADE', 'MENDES', 'FREITAS', 'CARDOSO', 'RAMOS',
+  'GONCALVES', 'DIAS', 'MOREIRA', 'NUNES', 'MARQUES', 'MACHADO', 'VIEIRA'
+]);
 
 /**
  * Converte data do GIAP (DD-MM-YYYY, DD/MM/YYYY ou ISO) pra YYYY-MM-DD.
