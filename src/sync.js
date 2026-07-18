@@ -169,9 +169,9 @@ export async function syncPorNome({
   let nomesRetornadosAmostra = null;
 
   try {
-    // Busca de 1 pessoa (filtrarNomeAlvo): quantidade=1 como no portal
-    // (competencia + instituicao + nome completo + codigo_orgao vazio).
-    const qtd = filtrarNomeAlvo ? 1 : 100;
+    // quantidade=100: portal aceita até 100; com nome longo costuma vir 0–poucos.
+    // Filtramos depois com nomeCasaPermissivo / similaridade.
+    const qtd = 100;
     const { data, requestUrl, raw } = await scrapeRemuneracoes({
       competencia,
       codigoInstituicao,

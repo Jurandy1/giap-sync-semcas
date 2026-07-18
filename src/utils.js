@@ -90,55 +90,70 @@ export function similaridadeNome(a, b) {
   return cobertura * 0.85 + tamanho * 0.15;
 }
 
+const PARTICULAS_NOME = new Set(['DA', 'DE', 'DO', 'DAS', 'DOS', 'E', 'DI', 'DU']);
+
+/** Funde pedaços quebrados no RH: "CONCEI CAO" / "Concei Ção" → CONCEICAO */
+export function fundirTokensCurtos(tokens) {
+  const out = [];
+  for (const t of tokens) {
+    if (t.length <= 3 && !PARTICULAS_NOME.has(t) && out.length > 0) {
+      out[out.length - 1] += t;
+    } else {
+      out.push(t);
+    }
+  }
+  return out;
+}
+
 /**
- * Nome para busca no GIAP — nome completo normalizado.
- * Igual ao Portal Dados Abertos:
- * nome_servidor=JURANDY+SOARES+SANTANA+JUNIOR&quantidade=1&codigo_orgao=
+ * Nome completo normalizado (com fusão de tokens curtos).
+ * Ex.: JURANDY SOARES SANTANA JUNIOR — como no Portal Dados Abertos.
  */
 export function nomeBuscaGiap(nome) {
-  const tokens = tokensNome(nome);
+  const tokens = fundirTokensCurtos(tokensNome(nome));
   if (!tokens.length) return null;
   return tokens.join(' ');
 }
 
 /**
- * Variantes para quem JÁ tem matrícula (só completar folha).
- * Quem NÃO tem matrícula deve usar só `nomeBuscaGiap` (nome completo).
+ * Variantes p/ sem matrícula: nome completo → encurta pelo fim (prefixo GIAP).
+ * Nunca usa 1 token só (evita ARIADNA/AROUCHE com homônimos).
+ * Máx. 5 scrapes por pessoa.
  */
-export function variantesBuscaGiap(nome) {
-  const tokens = tokensNome(nome);
-  if (!tokens.length) return [];
+export function variantesBuscaSemMatricula(nome) {
+  const tokens = fundirTokensCurtos(tokensNome(nome));
+  if (tokens.length < 2) return tokens.length ? [tokens[0]] : [];
 
-  const particulas = new Set(['DA', 'DE', 'DO', 'DAS', 'DOS', 'E', 'DI', 'DU']);
   const out = [];
-  const add = (s) => {
-    const v = String(s || '').trim();
-    if (v && !out.includes(v)) out.push(v);
+  const add = (arr) => {
+    if (!arr?.length) return;
+    const significativos = arr.filter((t) => !PARTICULAS_NOME.has(t));
+    if (significativos.length < 2) return;
+    const s = arr.join(' ');
+    if (!out.includes(s)) out.push(s);
   };
 
-  // Sempre nome completo primeiro (é o que o portal acerta)
-  add(tokens.join(' '));
-
-  const semPart = tokens.filter((t) => !particulas.has(t));
-  if (semPart.length >= 2 && semPart.join(' ') !== tokens.join(' ')) {
-    add(semPart.join(' '));
+  // Completo → vai removendo o último token (LIKE prefixo no portal)
+  for (let n = tokens.length; n >= 2 && out.length < 5; n--) {
+    add(tokens.slice(0, n));
   }
 
-  // Funde tokens curtos ("CONCEI CAO" → "CONCEICAO")
-  const fundido = [];
-  for (const t of tokens) {
-    if (t.length <= 3 && !particulas.has(t) && fundido.length > 0) {
-      fundido[fundido.length - 1] += t;
-    } else {
-      fundido.push(t);
+  // Sem partículas (RH tem "DA/DE", GIAP às vezes não)
+  const semPart = tokens.filter((t) => !PARTICULAS_NOME.has(t));
+  if (semPart.length >= 2) {
+    for (let n = semPart.length; n >= 2 && out.length < 5; n--) {
+      add(semPart.slice(0, n));
     }
   }
-  if (fundido.join(' ') !== tokens.join(' ')) {
-    add(fundido.join(' '));
-  }
 
-  // NÃO usa token único (ARIADNA, AROUCHE) — puxa homônimos errados.
-  return out;
+  return out.slice(0, 5);
+}
+
+/**
+ * Variantes gerais (quem já tem matrícula / completar folha).
+ */
+export function variantesBuscaGiap(nome) {
+  return variantesBuscaSemMatricula(nome);
 }
 
 /**

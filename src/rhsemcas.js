@@ -13,7 +13,8 @@ import {
   normalizarNome,
   similaridadeNome,
   nomeBuscaGiap,
-  variantesBuscaGiap
+  variantesBuscaGiap,
+  variantesBuscaSemMatricula
 } from './utils.js';
 import { getSupabase } from './supabase.js';
 
@@ -100,7 +101,7 @@ async function selectTudo(montarQuery, pageSize = 1000) {
   return out;
 }
 
-export { nomeBuscaGiap, variantesBuscaGiap };
+export { nomeBuscaGiap, variantesBuscaGiap, variantesBuscaSemMatricula };
 
 function cargoEhServicoPrestado(cargo) {
   if (!cargo) return false;
@@ -584,7 +585,7 @@ export async function listarBuscasNomePendentes(competencia) {
     if (tokensLen(hr.nome) < 2) continue;
 
     const variantes = !temMatricula
-      ? [nomeBuscaGiap(hr.nome)].filter(Boolean) // sem matrícula: SÓ nome completo
+      ? variantesBuscaSemMatricula(hr.nome) // completo → prefixos longos (≥2 tokens)
       : variantesBuscaGiap(hr.nome);
     if (!variantes.length) continue;
 
