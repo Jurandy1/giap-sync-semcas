@@ -137,15 +137,26 @@ app.post('/sync/nome', async (req, res) => {
       nomeServidor,
       codigoInstituicao = 1,
       competencia = competenciaAtual(),
-      filtrarNomeAlvo = null
+      filtrarNomeAlvo = null,
+      matricula = null,
+      apenasSemcas = true
     } = req.body;
     if (!nomeServidor) return res.status(400).json({ error: 'nomeServidor required' });
     if (!validarCompetencia(competencia)) return res.status(400).json({ error: 'competencia inválida' });
+
+    const { carregarCedenciasAtuais } = await import('./rhsemcas.js');
+    const ced = await carregarCedenciasAtuais();
+    const mat = matricula != null ? String(matricula).trim() : '';
+    const ehCedido = !!(mat && ced.mats.has(mat));
+
     const resultado = await syncPorNome({
       nomeServidor,
       codigoInstituicao,
       competencia,
-      filtrarNomeAlvo: filtrarNomeAlvo || nomeServidor
+      filtrarNomeAlvo: filtrarNomeAlvo || nomeServidor,
+      apenasSemcas: apenasSemcas !== false,
+      // Outras secretarias (SEMOSP etc.) só Cedidos/Recebidos
+      matriculasOutrosOrgaosOk: ehCedido ? [mat] : []
     });
     // Fecha Chrome após 1 nome — evita acumular RAM no Render free
     await closeBrowser().catch(() => {});

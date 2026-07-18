@@ -51,6 +51,9 @@ export const SUFIXOS_IGNORADOS = new Set([
  *     fragmentados no cadastro RH ("CONCEI CAO" vs "CONCEICAO") — OU
  * (2) todos os tokens não-triviais de A aparecem em B (ou vice-versa),
  *     ignorando `SUFIXOS_IGNORADOS` — captura `JR` vs `JUNIOR`.
+ *
+ * Importante: subconjunto só vale se os nomes tiverem tamanho parecido.
+ * Evita "MARIA DA CONCEICAO" casar com "CONCEICAO DE MARIA ABREU QUEIROZ".
  */
 export function nomeCasaPermissivo(a, b) {
   const na = normalizarNome(a);
@@ -67,7 +70,13 @@ export function nomeCasaPermissivo(a, b) {
   const setB = new Set(tb);
   const aInB = ta.every((t) => setB.has(t));
   const bInA = tb.every((t) => setA.has(t));
-  return aInB || bInA;
+  if (!aInB && !bInA) return false;
+
+  const menor = Math.min(ta.length, tb.length);
+  const maior = Math.max(ta.length, tb.length);
+  // 2 tokens vs 4+ = homônimo de outra secretaria — rejeita
+  if (menor / maior < 0.75) return false;
+  return true;
 }
 
 /**

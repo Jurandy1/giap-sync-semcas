@@ -8,7 +8,8 @@ import {
   CODIGO_ORGAO_SEMCAS,
   getSupabase,
   listarBuscasNomePendentes,
-  buscarDemissoesVinculos
+  buscarDemissoesVinculos,
+  carregarCedenciasAtuais
 } from './rhsemcas.js';
 import { competenciaAtual } from './utils.js';
 import { closeBrowser } from './scraper.js';
@@ -311,6 +312,11 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao, filt
         console.warn('[jobs] listar buscas nome', err.message);
       }
       const debugNomes = [];
+      let cedencias = { ids: new Set(), mats: new Set() };
+      try {
+        cedencias = await carregarCedenciasAtuais();
+      } catch (_) { /* ok */ }
+
       for (let i = 0; i < buscasNome.length; i++) {
         const item = buscasNome[i];
         // Free tier: só 1ª variante (nome completo). Prefixo sobra p/ "Puxar na API".
@@ -318,6 +324,9 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao, filt
           ? item.variantes
           : [item.busca].filter(Boolean);
         const variantes = variantesRaw.slice(0, MAX_VARIANTES_NOME);
+        const ehCedido =
+          cedencias.ids.has(item.funcionario_id) ||
+          (item.matricula && cedencias.mats.has(String(item.matricula).trim()));
         let bruto = 0;
         let posFiltro = 0;
         let inseridos = 0;
@@ -335,7 +344,14 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao, filt
                 nomeServidor: busca,
                 codigoInstituicao: 1,
                 competencia,
-                filtrarNomeAlvo: item.nome
+                filtrarNomeAlvo: item.nome,
+                // SEMCAS: só órgão 9. Outras secretarias = só Cedidos/Recebidos.
+                apenasSemcas: true,
+                matriculasOutrosOrgaosOk: ehCedido
+                  ? (item.matricula
+                    ? [String(item.matricula).trim()]
+                    : [...cedencias.mats])
+                  : []
               }),
               SCRAPE_WATCHDOG_MS,
               `sync_nome_${busca}`

@@ -8,8 +8,20 @@ import {
 } from './utils.js';
 import { getSupabase } from './supabase.js';
 
+const CODIGO_ORGAO_SEMCAS = process.env.GIAP_CODIGO_ORGAO || '9';
+const LOTACAO_SEMCAS = 'SEMCAS';
+
 function sb() {
   return getSupabase();
+}
+
+function ehFolhaSemcas(item) {
+  return (
+    String(item?.lotacao || '')
+      .toUpperCase()
+      .trim() === LOTACAO_SEMCAS ||
+    String(item?.codigo_orgao ?? '') === String(CODIGO_ORGAO_SEMCAS)
+  );
 }
 
 /**
@@ -140,6 +152,9 @@ export async function syncPorOrgao({ codigoOrgao, codigoInstituicao = 1, compete
  * Puxa servidores por nome e persiste.
  * @param {string} [filtrarNomeAlvo] se informado (busca de 1 pessoa), só grava
  *   quem tiver nome bem parecido — evita poluir a folha com homônimos de prefixo curto.
+ * @param {boolean} [apenasSemcas=true] com alvo de nome: só grava SEMCAS, salvo
+ *   matrículas em `matriculasOutrosOrgaosOk` (Cedidos/Recebidos).
+ * @param {string[]} [matriculasOutrosOrgaosOk] matrículas que podem gravar fora da SEMCAS.
  */
 export async function syncPorNome({
   nomeServidor,
@@ -147,10 +162,15 @@ export async function syncPorNome({
   competencia,
   filtrarOrgao = null,
   filtrarNomeAlvo = null,
-  similaridadeMin = 0.7
+  similaridadeMin = 0.88,
+  apenasSemcas = true,
+  matriculasOutrosOrgaosOk = null
 } = {}) {
   const inicio = Date.now();
   const orgaoFiltro = filtrarOrgao ? String(filtrarOrgao) : null;
+  const matsOk = matriculasOutrosOrgaosOk
+    ? new Set([...matriculasOutrosOrgaosOk].map((m) => String(m).trim()).filter(Boolean))
+    : null;
   const log = {
     tipo: 'nome',
     parametros: {
@@ -158,7 +178,8 @@ export async function syncPorNome({
       codigoInstituicao,
       competencia,
       filtrarNomeAlvo,
-      filtrarOrgao: orgaoFiltro
+      filtrarOrgao: orgaoFiltro,
+      apenasSemcas: !!apenasSemcas
     },
     registros_encontrados: 0,
     registros_filtrados: 0,
@@ -195,6 +216,15 @@ export async function syncPorNome({
           nomeCasaPermissivo(item.funcionario, filtrarNomeAlvo) ||
           similaridadeNome(filtrarNomeAlvo, item.funcionario) >= similaridadeMin
       );
+      // SEMCAS employee ≠ homônimo de SEMOSP/SEMUS etc.
+      // Outras secretarias só se for Cedido/Recebido (matrícula liberada).
+      if (apenasSemcas) {
+        filtradas = filtradas.filter((item) => {
+          if (ehFolhaSemcas(item)) return true;
+          const mat = item.matricula != null ? String(item.matricula).trim() : '';
+          return !!(matsOk && mat && matsOk.has(mat));
+        });
+      }
     }
     if (orgaoFiltro) {
       filtradas = filtradas.filter(

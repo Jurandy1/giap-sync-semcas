@@ -87,6 +87,28 @@ function ehFolhaSemcas(f) {
   );
 }
 
+/** Cedidos/Recebidos atuais — únicos que podem casar/gravar folha de outra secretaria. */
+export async function carregarCedenciasAtuais() {
+  const ids = new Set();
+  const mats = new Set();
+  try {
+    const { data, error } = await sb()
+      .from('v_cedencias_atuais')
+      .select('funcionario_id, matricula')
+      .limit(3000);
+    if (error) throw error;
+    for (const c of data || []) {
+      if (c.funcionario_id) ids.add(c.funcionario_id);
+      if (c.matricula != null && String(c.matricula).trim()) {
+        mats.add(String(c.matricula).trim());
+      }
+    }
+  } catch (e) {
+    console.warn('[cedencias]', e.message);
+  }
+  return { ids, mats };
+}
+
 function sb() {
   return getSupabase();
 }
