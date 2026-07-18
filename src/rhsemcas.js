@@ -32,20 +32,21 @@ function normalizarCategoria(c) {
     .trim();
 }
 
-const VINCULOS_FOLHA_PMSL = new Set(
+/** Vínculos que NÃO entram na folha GIAP / sync por nome. */
+const VINCULOS_EXCLUIDOS_GIAP = new Set(
   [
-    'SERVICO PRESTADO',
-    'EFETIVO',
-    'CONTRATO SEMUS',
-    'CONTRATO TEMPORARIO',
-    'COMISSIONADO'
+    'TERCEIRIZADO',
+    'TERCEIRIZADA',
+    'PROCAD',
+    'ESTAGIARIO',
+    'ESTAGIO',
+    'ESTAGIÁRIO'
   ].map(normalizarCategoria)
 );
 
 /**
- * IDs de funcionários cujo vínculo ativo cai na folha da Prefeitura no GIAP.
- * Terceirizados / estagiários / sem lotação ativa ficam de fora — não estão na
- * folha e apenas poluem "sem_match" / "revisao_ausencia".
+ * IDs elegíveis: todo ativo com lotação, exceto Terceirizado e PROCAD.
+ * (Antes era whitelist restrita — deixava muita gente de fora.)
  */
 async function carregarIdsElegiveisFolhaPmsl() {
   const lots = await selectTudo(() =>
@@ -68,8 +69,13 @@ async function carregarIdsElegiveisFolhaPmsl() {
   const ids = new Set();
   for (const l of lots || []) {
     if (l.data_fim) continue;
-    const cat = catById.get(l.vinculo_id);
-    if (cat && VINCULOS_FOLHA_PMSL.has(cat)) ids.add(l.funcionario_id);
+    const cat = catById.get(l.vinculo_id) || '';
+    // Sem categoria ou categoria excluída → fora
+    if (!cat) continue;
+    if (VINCULOS_EXCLUIDOS_GIAP.has(cat)) continue;
+    // Também exclui se o nome da categoria contém PROCAD / TERCEIRIZ
+    if (cat.includes('PROCAD') || cat.includes('TERCEIRIZ')) continue;
+    ids.add(l.funcionario_id);
   }
   return ids;
 }
