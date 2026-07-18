@@ -25,12 +25,13 @@ const IDS = {
 };
 
 let browserInstance = null;
+let remPage = null; // página reutilizada (evita reload do portal a cada busca)
 let scrapesDesdeRestart = 0;
 
-/** Reinicia o Chrome a cada N scrapes (Render free = 512MB). */
+/** Reinicia o Chrome a cada N consultas (com página reutilizada pode ser maior). */
 const BROWSER_RESTART_EVERY = Math.max(
   1,
-  Number(process.env.GIAP_BROWSER_RESTART_EVERY || 4)
+  Number(process.env.GIAP_BROWSER_RESTART_EVERY || 20)
 );
 
 /** Caminhos comuns de Chrome/Chromium em Docker/Linux (fallback). */
@@ -42,17 +43,27 @@ function resolverExecutablePath() {
     '/usr/bin/google-chrome-stable',
     '/usr/bin/google-chrome',
     '/usr/bin/chromium',
-    '/usr/bin/chromium-browser',
+    '/usr/bin/chromium-browser'
   ];
   for (const p of candidatos) {
     try {
       if (fs.existsSync(p)) return p;
-    } catch { /* ignore */ }
+    } catch {
+      /* ignore */
+    }
   }
-  return undefined; // deixa o Puppeteer usar o Chrome do cache dele
+  return undefined;
+}
+
+async function fecharPaginaRem() {
+  if (remPage) {
+    await remPage.close().catch(() => {});
+    remPage = null;
+  }
 }
 
 export async function closeBrowser() {
+  await fecharPaginaRem();
   if (browserInstance) {
     await browserInstance.close().catch(() => {});
     browserInstance = null;
@@ -69,7 +80,7 @@ export async function closeBrowser() {
 
 async function getBrowser() {
   if (scrapesDesdeRestart >= BROWSER_RESTART_EVERY) {
-    console.log('[puppeteer] reiniciando browser (RAM) após', scrapesDesdeRestart, 'scrapes');
+    console.log('[puppeteer] reiniciando browser (RAM) após', scrapesDesdeRestart, 'consultas');
     await closeBrowser();
   }
 
@@ -79,6 +90,7 @@ async function getBrowser() {
       return browserInstance;
     } catch {
       browserInstance = null;
+      remPage = null;
     }
   }
 
@@ -99,8 +111,6 @@ async function getBrowser() {
       '--no-first-run',
       '--metrics-recording-only',
       '--js-flags=--max-old-space-size=128',
-      // Em containers (Render/Railway) estes ajudam com pouca RAM.
-      // No Windows local eles derrubam o frame ("Navigating frame was detached").
       ...(process.env.PUPPETEER_DOCKER === '1'
         ? ['--single-process', '--no-zygote']
         : [])
@@ -143,16 +153,63 @@ async function prepararPaginaLeve(page) {
 }
 
 async function loadPortal(page, timeoutMs) {
-  await page.goto(PORTAL_URL, { waitUntil: 'networkidle2', timeout: timeoutMs });
+  // domcontentloaded é bem mais rápido que networkidle2 no APEX
+  await page.goto(PORTAL_URL, { waitUntil: 'domcontentloaded', timeout: timeoutMs });
   await page.waitForFunction(
     () => window.apex && window.apex.item && window.apex.item('P6_COMPETENCIA'),
-    { timeout: 20000 }
+    { timeout: 25000 }
   );
+}
+
+async function expandirAccordionRem(page) {
+  await page.evaluate((regionSel) => {
+    const reg = document.querySelector(regionSel);
+    if (!reg || !reg.classList.contains('is-collapsed')) return;
+    const openBtn =
+      reg.querySelector('button.t-Button--hideShow[aria-expanded="false"]') ||
+      reg.querySelector('button.t-Button--hideShow') ||
+      reg.querySelector('.t-Button--hideShow');
+    openBtn?.click();
+  }, IDS.regionRem);
+
+  await page.waitForFunction(
+    (regionSel) => {
+      const reg = document.querySelector(regionSel);
+      return !!reg && !reg.classList.contains('is-collapsed');
+    },
+    { timeout: 10000 },
+    IDS.regionRem
+  );
+  await new Promise((r) => setTimeout(r, 300));
+}
+
+/** Uma página viva do portal — reutilizada entre consultas. */
+async function getRemPage(timeoutMs) {
+  const browser = await getBrowser();
+
+  if (remPage) {
+    try {
+      const ok = await remPage.evaluate(
+        () => !!(window.apex && window.apex.item && window.apex.item('P6_COMPETENCIA'))
+      );
+      if (ok) return remPage;
+    } catch {
+      remPage = null;
+    }
+  }
+
+  const page = await browser.newPage();
+  await page.setDefaultTimeout(timeoutMs);
+  await prepararPaginaLeve(page);
+  await loadPortal(page, timeoutMs);
+  await expandirAccordionRem(page);
+  remPage = page;
+  return remPage;
 }
 
 /**
  * Puxa remuneração(ões) filtrando por competência + inst + órgão/nome.
- * Retorna { data: [], requestUrl, raw }.
+ * Reutiliza a mesma aba do portal (muito mais rápido / menos RAM).
  */
 export async function scrapeRemuneracoes({
   competencia,
@@ -160,42 +217,16 @@ export async function scrapeRemuneracoes({
   codigoOrgao = '',
   nomeServidor = '',
   quantidade = 100,
-  timeoutMs = 90000
+  timeoutMs = 60000
 } = {}) {
-  const browser = await getBrowser();
-  const page = await browser.newPage();
+  const page = await getRemPage(timeoutMs);
   scrapesDesdeRestart++;
 
-  try {
-    await page.setDefaultTimeout(timeoutMs);
-    await prepararPaginaLeve(page);
-    await loadPortal(page, timeoutMs);
-    
-    // Expande o accordion do /remuneracoes (costuma vir colapsado)
-    await page.evaluate((regionSel) => {
-      const reg = document.querySelector(regionSel);
-      if (!reg || !reg.classList.contains('is-collapsed')) return;
-      // Preferir o botão com aria-expanded=false (o de abrir)
-      const openBtn =
-        reg.querySelector('button.t-Button--hideShow[aria-expanded="false"]') ||
-        reg.querySelector('button.t-Button--hideShow') ||
-        reg.querySelector('.t-Button--hideShow');
-      openBtn?.click();
-    }, IDS.regionRem);
+  // Token pra detectar resultado novo (evita ler resposta anterior)
+  const token = `giap_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 
-    await page.waitForFunction(
-      (regionSel) => {
-        const reg = document.querySelector(regionSel);
-        return !!reg && !reg.classList.contains('is-collapsed');
-      },
-      { timeout: 15000 },
-      IDS.regionRem
-    );
-    // APEX anima o body; dá um respiro pro layout
-    await new Promise(r => setTimeout(r, 800));
-    
-    // Preenche campos e limpa resultado anterior
-    await page.evaluate((ids, params) => {
+  await page.evaluate(
+    (ids, params, token) => {
       apex.item(ids.competencia).setValue(String(params.competencia));
       apex.item(ids.codigoInstituicao).setValue(String(params.codigoInstituicao));
       if (params.codigoOrgao !== '' && params.codigoOrgao != null) {
@@ -204,41 +235,51 @@ export async function scrapeRemuneracoes({
         apex.item(ids.codigoOrgao).setValue('');
       }
       if (params.nomeServidor !== '' && params.nomeServidor != null) {
-        // Portal espera nome completo em maiúsculas (ex.: JURANDY SOARES SANTANA JUNIOR)
         apex.item(ids.nomeServidor).setValue(String(params.nomeServidor).trim());
       } else {
         apex.item(ids.nomeServidor).setValue('');
       }
       apex.item(ids.quantidade).setValue(String(params.quantidade));
-      apex.item(ids.resultadoRem).setValue('');
+      // marca o campo antes do click; a resposta do APEX sobrescreve
+      apex.item(ids.resultadoRem).setValue(token);
       apex.item(ids.requestUrlRem).setValue('');
-    }, IDS, { competencia, codigoInstituicao, codigoOrgao, nomeServidor, quantidade });
-    
-    // Click via DOM (não exige bounding box)
-    await page.$eval(IDS.botaoExecutaRem, (el) => {
-      el.scrollIntoView({ block: 'center', inline: 'center' });
-      el.click();
-    });
-    
-    // Aguarda resultado aparecer
+    },
+    IDS,
+    { competencia, codigoInstituicao, codigoOrgao, nomeServidor, quantidade },
+    token
+  );
+
+  await page.$eval(IDS.botaoExecutaRem, (el) => {
+    el.scrollIntoView({ block: 'center', inline: 'center' });
+    el.click();
+  });
+
+  try {
     await page.waitForFunction(
-      (id) => {
+      (id, token) => {
         const v = apex.item(id).getValue();
-        return v && String(v).trim().length > 0;
+        if (!v || !String(v).trim()) return false;
+        return String(v).trim() !== token;
       },
-      { timeout: timeoutMs, polling: 500 },
-      IDS.resultadoRem
+      { timeout: timeoutMs, polling: 300 },
+      IDS.resultadoRem,
+      token
     );
-    
-    const { raw, requestUrl } = await page.evaluate((ids) => ({
+  } catch (err) {
+    // Sem resultado a tempo — devolve vazio em vez de derrubar o job inteiro
+    console.warn('[scraper] timeout remuneracoes', nomeServidor || codigoOrgao || '', err.message);
+    return { data: [], requestUrl: null, raw: '' };
+  }
+
+  const { raw, requestUrl } = await page.evaluate(
+    (ids) => ({
       raw: apex.item(ids.resultadoRem).getValue(),
       requestUrl: apex.item(ids.requestUrlRem).getValue()
-    }), IDS);
-    
-    return { data: parseResult(raw), requestUrl, raw };
-  } finally {
-    await page.close().catch(() => {});
-  }
+    }),
+    IDS
+  );
+
+  return { data: parseResult(raw), requestUrl, raw };
 }
 
 /**
@@ -250,6 +291,8 @@ export async function scrapeOrgaos({
   codigoInstituicao = 1,
   timeoutMs = 60000
 } = {}) {
+  // Órgãos: página separada (não mistura com sessão de remuneracoes)
+  await fecharPaginaRem();
   const browser = await getBrowser();
   const page = await browser.newPage();
   scrapesDesdeRestart++;
@@ -258,41 +301,47 @@ export async function scrapeOrgaos({
     await page.setDefaultTimeout(timeoutMs);
     await prepararPaginaLeve(page);
     await loadPortal(page, timeoutMs);
-    
-    // Troca instituição se necessário
+
     const instAtual = await page.evaluate((id) => apex.item(id).getValue(), IDS.instituicao);
     if (String(instAtual) !== String(codigoInstituicao)) {
-      await page.evaluate((id, ci) => apex.item(id).setValue(String(ci)), IDS.instituicao, codigoInstituicao);
-      // Espera reload que o APEX dispara
-      await new Promise(r => setTimeout(r, 2000));
+      await page.evaluate(
+        (id, ci) => apex.item(id).setValue(String(ci)),
+        IDS.instituicao,
+        codigoInstituicao
+      );
+      await new Promise((r) => setTimeout(r, 1500));
       await loadPortal(page, timeoutMs);
     }
-    
-    // Expande accordion de /orgaos
+
     await page.evaluate((sel) => {
       const reg = document.querySelector(sel);
       if (reg && reg.classList.contains('is-collapsed')) {
         reg.querySelector('.t-Button--hideShow')?.click();
       }
     }, IDS.regionOrgao);
-    
-    await page.evaluate((ids, co, no) => {
-      apex.item(ids.codigoOrgaoOG).setValue(String(co ?? ''));
-      apex.item(ids.nomeOrgao).setValue(String(no ?? ''));
-      apex.item(ids.resultadoOrgao).setValue('');
-    }, IDS, codigoOrgao, nomeOrgao);
-    
+
+    await page.evaluate(
+      (ids, co, no) => {
+        apex.item(ids.codigoOrgaoOG).setValue(String(co ?? ''));
+        apex.item(ids.nomeOrgao).setValue(String(no ?? ''));
+        apex.item(ids.resultadoOrgao).setValue('');
+      },
+      IDS,
+      codigoOrgao,
+      nomeOrgao
+    );
+
     await page.click(IDS.botaoExecutaOrgao);
-    
+
     await page.waitForFunction(
       (id) => {
         const v = apex.item(id).getValue();
         return v && String(v).trim().length > 0;
       },
-      { timeout: timeoutMs, polling: 500 },
+      { timeout: timeoutMs, polling: 400 },
       IDS.resultadoOrgao
     );
-    
+
     const raw = await page.evaluate((ids) => apex.item(ids.resultadoOrgao).getValue(), IDS);
     return { data: parseResult(raw), raw };
   } finally {
@@ -302,7 +351,6 @@ export async function scrapeOrgaos({
 
 function parseResult(raw) {
   if (!raw) return [];
-  // O textarea às vezes vem com "Resultado\n" antes do JSON
   const clean = String(raw).replace(/^Resultado\s*/i, '').trim();
   try {
     const parsed = JSON.parse(clean);
@@ -313,4 +361,3 @@ function parseResult(raw) {
     return [];
   }
 }
-

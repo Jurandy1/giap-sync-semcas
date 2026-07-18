@@ -15,7 +15,7 @@ services:
       - key: NODE_OPTIONS
         value: "--max-old-space-size=192"
       - key: GIAP_MAX_BUSCAS_NOME
-        value: "60"
+        value: "20"
       - key: GIAP_BROWSER_RESTART_EVERY
-        value: "4"
+        value: "20"
       # API_KEY, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY: cadastre no Dashboard

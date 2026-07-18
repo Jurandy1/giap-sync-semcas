@@ -12,8 +12,14 @@ import {
 import { competenciaAtual } from './utils.js';
 import { closeBrowser } from './scraper.js';
 
-/** Limite de buscas por nome completo (Render free ~512MB). Nome completo = 1 scrape. */
-const MAX_BUSCAS_NOME = Math.max(0, Number(process.env.GIAP_MAX_BUSCAS_NOME || 60));
+/** Limite de buscas por nome (Render free). Página reutilizada ≈ 1 scrape leve. */
+const MAX_BUSCAS_NOME = Math.max(0, Number(process.env.GIAP_MAX_BUSCAS_NOME || 20));
+
+/** Se já tem muitos registros SEMCAS na folha, pula A–Z (só busca nomes faltantes). */
+const FOLHA_MIN_SKIP_LETRAS = Math.max(
+  50,
+  Number(process.env.GIAP_FOLHA_MIN_SKIP_LETRAS || 400)
+);
 
 const running = new Map(); // jobId -> promise
 
@@ -103,29 +109,54 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao }) {
         codigoInstituicao: 1,
         competencia
       });
-      // GIAP limita a ~100 — completa com prefixos A–Z e depois nome completo (limitado)
+      // GIAP limita a ~100 — completa com A–Z só se a folha ainda estiver magra
       let extras = 0;
-      const letras = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split('');
-      for (let i = 0; i < letras.length; i++) {
-        try {
-          const r = await syncPorNome({
-            nomeServidor: letras[i],
-            codigoInstituicao: 1,
-            competencia,
-            codigoOrgao: String(codigoOrgao)
-          });
-          extras += r.registros_inseridos || 0;
-        } catch (err) {
-          console.warn('[jobs] sync letra', letras[i], err.message);
-        }
-        await updateJob(jobId, {
-          progresso_pct: Math.round(5 + ((i + 1) / letras.length) * 15),
-          resumo: { ...resumo, etapa: `sync_letra_${letras[i]}` }
-        });
+      let letrasFeitas = 0;
+      let pulouLetras = false;
+      let folhaAntes = 0;
+      try {
+        const { count } = await sb()
+          .from('folha_pmsl')
+          .select('id', { count: 'exact', head: true })
+          .eq('competencia', competencia)
+          .or(`lotacao.eq.SEMCAS,codigo_orgao.eq.${codigoOrgao}`);
+        folhaAntes = count || 0;
+      } catch {
+        /* ignore */
       }
 
-      // Libera RAM do Chrome antes das buscas por nome
-      await closeBrowser();
+      if (folhaAntes >= FOLHA_MIN_SKIP_LETRAS) {
+        pulouLetras = true;
+        await updateJob(jobId, {
+          progresso_pct: 20,
+          resumo: {
+            ...resumo,
+            etapa: `skip_letras_folha_${folhaAntes}`
+          }
+        });
+      } else {
+        const letras = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split('');
+        for (let i = 0; i < letras.length; i++) {
+          try {
+            const r = await syncPorNome({
+              nomeServidor: letras[i],
+              codigoInstituicao: 1,
+              competencia,
+              codigoOrgao: String(codigoOrgao)
+            });
+            extras += r.registros_inseridos || 0;
+            letrasFeitas++;
+          } catch (err) {
+            console.warn('[jobs] sync letra', letras[i], err.message);
+          }
+          await updateJob(jobId, {
+            progresso_pct: Math.round(5 + ((i + 1) / letras.length) * 12),
+            resumo: { ...resumo, etapa: `sync_letra_${letras[i]}` }
+          });
+        }
+      }
+
+      // Mantém a mesma aba do Chrome para as buscas por nome (sem closeBrowser aqui)
 
       let extrasNomes = 0;
       let nomesEncontrados = 0;
@@ -135,9 +166,9 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao }) {
       let buscasPendentes = 0;
       try {
         const todas = await listarBuscasNomeSemMatricula(competencia);
-        // Prioriza nomes com mais tokens (prefixo mais distintivo) e corta no limite de RAM
         todas.sort(
-          (a, b) => (b.variantes?.[0] || b.busca || '').split(' ').length -
+          (a, b) =>
+            (b.variantes?.[0] || b.busca || '').split(' ').length -
             (a.variantes?.[0] || a.busca || '').split(' ').length
         );
         buscasPendentes = Math.max(0, todas.length - MAX_BUSCAS_NOME);
@@ -147,37 +178,29 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao }) {
       }
       for (let i = 0; i < buscasNome.length; i++) {
         const item = buscasNome[i];
-        // Portal aceita nome completo (ex.: JURANDY SOARES SANTANA JUNIOR).
-        // Fallback: sem partículas / primeiro+último se o completo vier vazio.
-        const variantes = (item.variantes || [item.busca]).filter(Boolean).slice(0, 3);
-        let achou = false;
-        for (const prefixo of variantes) {
-          try {
-            scrapesNome++;
-            const r = await syncPorNome({
-              nomeServidor: prefixo,
-              codigoInstituicao: 1,
-              competencia,
-              codigoOrgao: '',
-              filtrarNomeAlvo: item.nome
-            });
-            extrasNomes += r.registros_inseridos || 0;
-            // Só conta hit se gravou alguém com nome parecido com o do RH
-            if ((r.registros_inseridos || 0) > 0) {
-              nomesEncontrados++;
-              achou = true;
-              break;
-            }
-          } catch (err) {
-            console.warn('[jobs] sync nome', prefixo, err.message);
-          }
+        // 1 tentativa: nome completo (como no Portal Dados Abertos)
+        const busca = (item.variantes && item.variantes[0]) || item.busca;
+        try {
+          scrapesNome++;
+          const r = await syncPorNome({
+            nomeServidor: busca,
+            codigoInstituicao: 1,
+            competencia,
+            codigoOrgao: '',
+            filtrarNomeAlvo: item.nome
+          });
+          extrasNomes += r.registros_inseridos || 0;
+          if ((r.registros_inseridos || 0) > 0) nomesEncontrados++;
+          else nomesVazios++;
+        } catch (err) {
+          nomesVazios++;
+          console.warn('[jobs] sync nome', busca, err.message);
         }
-        if (!achou) nomesVazios++;
 
-        if (i % 5 === 0 || i === buscasNome.length - 1) {
+        if (i % 3 === 0 || i === buscasNome.length - 1) {
           await updateJob(jobId, {
             progresso_pct: Math.round(
-              20 + ((i + 1) / Math.max(buscasNome.length, 1)) * 10
+              18 + ((i + 1) / Math.max(buscasNome.length, 1)) * 12
             ),
             resumo: {
               ...resumo,
@@ -191,12 +214,14 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao }) {
       await closeBrowser();
 
       resumo.sync = {
-        // órgão SEMCAS (não confundir com buscas por nome)
         orgao_encontrados: syncRes.registros_encontrados,
         orgao_inseridos: syncRes.registros_inseridos,
         encontrados: syncRes.registros_encontrados,
         inseridos: syncRes.registros_inseridos,
         extras_letras: extras,
+        letras_feitas: letrasFeitas,
+        pulou_letras: pulouLetras,
+        folha_antes: folhaAntes,
         extras_nomes: extrasNomes,
         buscas_nome: buscasNome.length,
         buscas_nome_pendentes: buscasPendentes,
