@@ -159,7 +159,8 @@ app.post('/sync/nome', async (req, res) => {
       filtrarNomeAlvo: filtrarNomeAlvo || nomeServidor,
       apenasSemcas: apenasSemcas !== false,
       matriculasOutrosOrgaosOk: matsOk,
-      // diagnóstico leve
+      // Puxar 1 nome: tenta MAIÚSCULAS + prefixos (env GIAP_MAX_VARIANTES_NOME=1 no job em lote)
+      maxVariantes: 4,
       meta: { ehCedido, matriculaRh: mat || null }
     });
     // Fecha Chrome após 1 nome — evita acumular RAM no Render free

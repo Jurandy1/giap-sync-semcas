@@ -272,7 +272,9 @@ async function scrapeRemuneracoesOnce({
       apex.item(ids.competencia).setValue(String(params.competencia));
       apex.item(ids.codigoInstituicao).setValue(String(params.codigoInstituicao));
       apex.item(ids.codigoOrgao).setValue('', null, true);
-      const nome = params.nomeServidor != null ? String(params.nomeServidor).trim() : '';
+      const nomeRaw = params.nomeServidor != null ? String(params.nomeServidor).trim() : '';
+      // Portal indexa em MAIÚSCULAS — minúsculas do RH costumam retornar vazio
+      const nome = nomeRaw.toUpperCase();
       apex.item(ids.nomeServidor).setValue('', null, true);
       apex.item(ids.nomeServidor).setValue(nome, null, true);
       apex.item(ids.quantidade).setValue(String(params.quantidade));

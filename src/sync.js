@@ -4,7 +4,9 @@ import {
   normalizarNome,
   parseDataBR,
   similaridadeNome,
-  nomeCasaPermissivo
+  nomeCasaPermissivo,
+  nomeBuscaGiap,
+  variantesBuscaGiap
 } from './utils.js';
 import { getSupabase } from './supabase.js';
 
@@ -178,7 +180,9 @@ export async function syncPorNome({
   filtrarNomeAlvo = null,
   similaridadeMin = 0.88,
   apenasSemcas = true,
-  matriculasOutrosOrgaosOk = null
+  matriculasOutrosOrgaosOk = null,
+  /** Quantas variantes de nome tentar (Puxar 1 a 1: use ≥3). */
+  maxVariantes = null
 } = {}) {
   const inicio = Date.now();
   const orgaoFiltro = filtrarOrgao ? String(filtrarOrgao) : null;
@@ -206,21 +210,56 @@ export async function syncPorNome({
 
   let rawAmostra = null;
   let nomesRetornadosAmostra = null;
+  let buscaUsada = null;
 
   try {
-    // quantidade=100: portal aceita até 100; com nome longo costuma vir 0–poucos.
-    // Filtramos depois com nomeCasaPermissivo / similaridade.
+    // Portal GIAP espera nome em MAIÚSCULAS (ex.: JURANDY SOARES SANTANA JUNIOR).
+    // Se o completo vier vazio, tenta prefixos: JURANDY SOARES SANTANA → JURANDY SOARES…
     const qtd = 100;
-    const { data, requestUrl, raw } = await scrapeRemuneracoes({
-      competencia,
-      codigoInstituicao,
-      nomeServidor,
-      quantidade: qtd
-    });
+    const maxVar = Math.max(
+      1,
+      Number(
+        maxVariantes != null
+          ? maxVariantes
+          : process.env.GIAP_MAX_VARIANTES_NOME || 4
+      )
+    );
+    const variantes = [];
+    const addVar = (s) => {
+      const v = nomeBuscaGiap(s) || (normalizarNome(s) || '').trim();
+      if (v && !variantes.includes(v)) variantes.push(v);
+    };
+    addVar(nomeServidor);
+    for (const v of variantesBuscaGiap(nomeServidor)) addVar(v);
+    // Sem JUNIOR/JR no fim (às vezes o portal indexa sem sufixo)
+    const tokens = (nomeBuscaGiap(nomeServidor) || '').split(' ').filter(Boolean);
+    if (tokens.length >= 3) {
+      const semSufixo = tokens.filter((t) => t !== 'JUNIOR' && t !== 'JR');
+      if (semSufixo.length >= 2) addVar(semSufixo.join(' '));
+    }
+
+    let data = [];
+    let requestUrl = null;
+    let raw = '';
+    for (const busca of variantes.slice(0, maxVar)) {
+      buscaUsada = busca;
+      const r = await scrapeRemuneracoes({
+        competencia,
+        codigoInstituicao,
+        nomeServidor: busca,
+        quantidade: qtd
+      });
+      data = r.data || [];
+      requestUrl = r.requestUrl;
+      raw = r.raw || '';
+      if (data.length > 0) break;
+    }
 
     log.registros_encontrados = data.length;
     log.parametros.request_url = requestUrl;
     log.parametros.quantidade = qtd;
+    log.parametros.busca_usada = buscaUsada;
+    log.parametros.variantes_tentadas = variantes.slice(0, maxVar);
     if (data.length === 0) {
       rawAmostra = String(raw || '').slice(0, 200);
     } else {
@@ -228,25 +267,25 @@ export async function syncPorNome({
     }
 
     let filtradas = data;
-  // Também aceita linha cuja matrícula está liberada (RH / Cedido),
-  // mesmo se o filtro de nome falhar por grafia estranha no portal.
-  if (filtrarNomeAlvo || matsOk?.size) {
-    filtradas = data.filter((item) => {
-      if (matLiberada(matsOk, item.matricula)) return true;
-      if (!filtrarNomeAlvo) return false;
-      return (
-        nomeCasaPermissivo(item.funcionario, filtrarNomeAlvo) ||
-        similaridadeNome(filtrarNomeAlvo, item.funcionario) >= similaridadeMin
-      );
-    });
-    // SEMCAS employee ≠ homônimo de SEMOSP/SEMUS etc.
-    // Outras secretarias só se matrícula liberada (RH puxado / Cedido).
-    if (apenasSemcas) {
-      filtradas = filtradas.filter(
-        (item) => ehFolhaSemcas(item) || matLiberada(matsOk, item.matricula)
-      );
+    // Também aceita linha cuja matrícula está liberada (RH / Cedido),
+    // mesmo se o filtro de nome falhar por grafia estranha no portal.
+    if (filtrarNomeAlvo || matsOk?.size) {
+      filtradas = data.filter((item) => {
+        if (matLiberada(matsOk, item.matricula)) return true;
+        if (!filtrarNomeAlvo) return false;
+        return (
+          nomeCasaPermissivo(item.funcionario, filtrarNomeAlvo) ||
+          similaridadeNome(filtrarNomeAlvo, item.funcionario) >= similaridadeMin
+        );
+      });
+      // SEMCAS employee ≠ homônimo de SEMOSP/SEMUS etc.
+      // Outras secretarias só se matrícula liberada (RH puxado / Cedido).
+      if (apenasSemcas) {
+        filtradas = filtradas.filter(
+          (item) => ehFolhaSemcas(item) || matLiberada(matsOk, item.matricula)
+        );
+      }
     }
-  }
     if (orgaoFiltro) {
       filtradas = filtradas.filter(
         (item) => String(item.codigo_orgao) === orgaoFiltro
