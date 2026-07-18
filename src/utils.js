@@ -46,11 +46,20 @@ export const SUFIXOS_IGNORADOS = new Set([
 ]);
 
 /**
- * Casamento permissivo: verdadeiro se todos os tokens não-triviais de A
- * aparecem em B (ou vice-versa), ignorando `SUFIXOS_IGNORADOS`.
- * Captura casos como `JURANDY SOARES SANTANA JR` vs `JURANDY SOARES SANTANA JUNIOR`.
+ * Casamento permissivo: verdadeiro se
+ * (1) os nomes concatenados sem espaço batem exato — captura tokens
+ *     fragmentados no cadastro RH ("CONCEI CAO" vs "CONCEICAO") — OU
+ * (2) todos os tokens não-triviais de A aparecem em B (ou vice-versa),
+ *     ignorando `SUFIXOS_IGNORADOS` — captura `JR` vs `JUNIOR`.
  */
 export function nomeCasaPermissivo(a, b) {
+  const na = normalizarNome(a);
+  const nb = normalizarNome(b);
+  if (!na || !nb) return false;
+  const semA = na.replace(/\s+/g, '');
+  const semB = nb.replace(/\s+/g, '');
+  if (semA && semA === semB) return true;
+
   const ta = tokensNome(a).filter((t) => !SUFIXOS_IGNORADOS.has(t));
   const tb = tokensNome(b).filter((t) => !SUFIXOS_IGNORADOS.has(t));
   if (!ta.length || !tb.length) return false;
@@ -94,7 +103,8 @@ export function nomeBuscaGiap(nome) {
 
 /**
  * Variantes de busca: nome completo primeiro; se falhar, tenta sem partículas
- * (DA/DE/DOS) e depois primeiro+último sobrenome.
+ * (DA/DE/DOS), depois com tokens curtos fundidos ("CONCEI CAO" → "CONCEICAO"),
+ * depois primeiro+último sobrenome.
  */
 export function variantesBuscaGiap(nome) {
   const tokens = tokensNome(nome);
@@ -113,8 +123,34 @@ export function variantesBuscaGiap(nome) {
   if (semPart.length >= 2 && semPart.join(' ') !== tokens.join(' ')) {
     add(semPart.join(' '));
   }
-  if (semPart.length >= 3) {
-    add(`${semPart[0]} ${semPart[semPart.length - 1]}`);
+
+  // Funde tokens curtos (<=3 chars, exceto partículas) com o anterior:
+  // "CONCEI CAO" → "CONCEICAO". Cobre fragmentação por erro de digitação.
+  const fundido = [];
+  for (const t of tokens) {
+    if (
+      t.length <= 3 &&
+      !particulas.has(t) &&
+      fundido.length > 0
+    ) {
+      fundido[fundido.length - 1] += t;
+    } else {
+      fundido.push(t);
+    }
+  }
+  const fundidoSemPart = fundido.filter((t) => !particulas.has(t));
+  if (fundidoSemPart.length >= 2) {
+    add(fundidoSemPart.join(' '));
+  }
+
+  // Primeiro + último sobrenome — ignora sufixos como JR/JUNIOR/FILHO/NETO.
+  const semSufixos = semPart.filter((t) => !SUFIXOS_IGNORADOS.has(t));
+  const alvoPU = semSufixos.length >= 2 ? semSufixos : semPart;
+  if (alvoPU.length >= 3) {
+    add(`${alvoPU[0]} ${alvoPU[alvoPU.length - 1]}`);
+  } else if (alvoPU.length === 2 && semPart.length >= 3) {
+    // Só emite se a versão com sufixos era mais longa (senão duplica variante 0)
+    add(`${alvoPU[0]} ${alvoPU[1]}`);
   }
 
   return out;
