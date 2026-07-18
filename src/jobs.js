@@ -142,7 +142,7 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao }) {
               nomeServidor: letras[i],
               codigoInstituicao: 1,
               competencia,
-              codigoOrgao: String(codigoOrgao)
+              filtrarOrgao: String(codigoOrgao)
             });
             extras += r.registros_inseridos || 0;
             letrasFeitas++;
@@ -161,6 +161,10 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao }) {
       let extrasNomes = 0;
       let nomesEncontrados = 0;
       let nomesVazios = 0;
+      let nomesScrapeVazio = 0;
+      let nomesRejeitadosFiltro = 0;
+      let nomesSemMatricula = 0;
+      let nomesEncontradosReais = 0;
       let scrapesNome = 0;
       let buscasNome = [];
       let buscasPendentes = 0;
@@ -186,14 +190,24 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao }) {
             nomeServidor: busca,
             codigoInstituicao: 1,
             competencia,
-            codigoOrgao: '',
             filtrarNomeAlvo: item.nome
           });
-          extrasNomes += r.registros_inseridos || 0;
-          if ((r.registros_inseridos || 0) > 0) nomesEncontrados++;
-          else nomesVazios++;
+          const bruto = r.registros_encontrados || 0;
+          const posFiltro = r.registros_filtrados || 0;
+          const inseridos = r.registros_inseridos || 0;
+          extrasNomes += inseridos;
+          if (inseridos > 0) {
+            nomesEncontrados++;
+            nomesEncontradosReais++;
+          } else {
+            nomesVazios++;
+            if (bruto === 0) nomesScrapeVazio++;
+            else if (posFiltro === 0) nomesRejeitadosFiltro++;
+            else nomesSemMatricula++;
+          }
         } catch (err) {
           nomesVazios++;
+          nomesScrapeVazio++;
           console.warn('[jobs] sync nome', busca, err.message);
         }
 
@@ -214,9 +228,11 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao }) {
       await closeBrowser();
 
       resumo.sync = {
-        orgao_encontrados: syncRes.registros_encontrados,
+        orgao_bruto: syncRes.registros_encontrados,
+        orgao_filtrado: syncRes.registros_filtrados,
+        orgao_encontrados: syncRes.registros_filtrados,
         orgao_inseridos: syncRes.registros_inseridos,
-        encontrados: syncRes.registros_encontrados,
+        encontrados: syncRes.registros_filtrados,
         inseridos: syncRes.registros_inseridos,
         extras_letras: extras,
         letras_feitas: letrasFeitas,
@@ -227,6 +243,10 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao }) {
         buscas_nome_pendentes: buscasPendentes,
         nomes_encontrados: nomesEncontrados,
         nomes_vazios: nomesVazios,
+        nomes_scrape_vazio: nomesScrapeVazio,
+        nomes_rejeitados_filtro: nomesRejeitadosFiltro,
+        nomes_sem_matricula: nomesSemMatricula,
+        nomes_encontrados_reais: nomesEncontradosReais,
         scrapes_nome: scrapesNome,
         success: syncRes.success
       };

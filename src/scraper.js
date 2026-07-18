@@ -219,6 +219,15 @@ export async function scrapeRemuneracoes({
   quantidade = 100,
   timeoutMs = 60000
 } = {}) {
+  // O portal /remuneracoes zera a resposta quando codigo_orgao é enviado.
+  // Filtramos por órgão no backend (usando row.codigo_orgao no JSON de retorno).
+  if (codigoOrgao !== '' && codigoOrgao != null) {
+    console.warn(
+      '[scraper] codigoOrgao ignorado no portal (retornaria vazio). Filtre pós-scrape. Recebido:',
+      codigoOrgao
+    );
+  }
+
   const page = await getRemPage(timeoutMs);
   scrapesDesdeRestart++;
 
@@ -229,23 +238,16 @@ export async function scrapeRemuneracoes({
     (ids, params, token) => {
       apex.item(ids.competencia).setValue(String(params.competencia));
       apex.item(ids.codigoInstituicao).setValue(String(params.codigoInstituicao));
-      if (params.codigoOrgao !== '' && params.codigoOrgao != null) {
-        apex.item(ids.codigoOrgao).setValue(String(params.codigoOrgao));
-      } else {
-        apex.item(ids.codigoOrgao).setValue('');
-      }
-      if (params.nomeServidor !== '' && params.nomeServidor != null) {
-        apex.item(ids.nomeServidor).setValue(String(params.nomeServidor).trim());
-      } else {
-        apex.item(ids.nomeServidor).setValue('');
-      }
+      apex.item(ids.codigoOrgao).setValue('', null, true);
+      const nome = params.nomeServidor != null ? String(params.nomeServidor).trim() : '';
+      apex.item(ids.nomeServidor).setValue('', null, true);
+      apex.item(ids.nomeServidor).setValue(nome, null, true);
       apex.item(ids.quantidade).setValue(String(params.quantidade));
-      // marca o campo antes do click; a resposta do APEX sobrescreve
       apex.item(ids.resultadoRem).setValue(token);
       apex.item(ids.requestUrlRem).setValue('');
     },
     IDS,
-    { competencia, codigoInstituicao, codigoOrgao, nomeServidor, quantidade },
+    { competencia, codigoInstituicao, nomeServidor, quantidade },
     token
   );
 

@@ -3,7 +3,8 @@ import {
   normalizarCPF,
   normalizarNome,
   parseDataBR,
-  similaridadeNome
+  similaridadeNome,
+  nomeCasaPermissivo
 } from './utils.js';
 import { getSupabase } from './supabase.js';
 
@@ -55,37 +56,45 @@ export async function syncPorOrgao({ codigoOrgao, codigoInstituicao = 1, compete
   const log = {
     tipo: 'orgao',
     parametros: { codigoOrgao, codigoInstituicao, competencia },
-    registros_encontrados: 0,
+    registros_encontrados: 0, // bruto do portal
+    registros_filtrados: 0,   // após filtro pós-scrape por codigo_orgao
     registros_inseridos: 0
   };
-  
+
   try {
+    // Portal zera resposta quando codigo_orgao é enviado — filtramos pós-scrape.
     const { data, requestUrl } = await scrapeRemuneracoes({
       competencia,
       codigoInstituicao,
-      codigoOrgao,
       quantidade: 100
     });
-    
+
     log.registros_encontrados = data.length;
     log.parametros.request_url = requestUrl;
-    
-    if (data.length > 0) {
-      const registros = data
+
+    const filtradas = codigoOrgao
+      ? data.filter((r) => String(r.codigo_orgao) === String(codigoOrgao))
+      : data;
+    log.registros_filtrados = filtradas.length;
+
+    if (filtradas.length > 0) {
+      const registros = filtradas
         .map(transformar)
-        .filter(r => r.matricula); // só persiste quem tem matrícula
-      
-      const { error, data: inseridos } = await sb()
-        .from('folha_pmsl')
-        .upsert(registros, {
-          onConflict: 'competencia,matricula,codigo_instituicao'
-        })
-        .select('id');
-      
-      if (error) throw error;
-      log.registros_inseridos = inseridos?.length || 0;
+        .filter((r) => r.matricula);
+
+      if (registros.length > 0) {
+        const { error, data: inseridos } = await sb()
+          .from('folha_pmsl')
+          .upsert(registros, {
+            onConflict: 'competencia,matricula,codigo_instituicao'
+          })
+          .select('id');
+
+        if (error) throw error;
+        log.registros_inseridos = inseridos?.length || 0;
+      }
     }
-    
+
     log.duracao_ms = Date.now() - inicio;
     await logSync(log);
     return { success: true, ...log };
@@ -106,24 +115,30 @@ export async function syncPorNome({
   nomeServidor,
   codigoInstituicao = 1,
   competencia,
-  codigoOrgao = '',
+  filtrarOrgao = null,
   filtrarNomeAlvo = null,
-  similaridadeMin = 0.9
+  similaridadeMin = 0.7
 } = {}) {
   const inicio = Date.now();
+  const orgaoFiltro = filtrarOrgao ? String(filtrarOrgao) : null;
   const log = {
     tipo: 'nome',
-    parametros: { nomeServidor, codigoInstituicao, competencia, codigoOrgao, filtrarNomeAlvo },
+    parametros: {
+      nomeServidor,
+      codigoInstituicao,
+      competencia,
+      filtrarNomeAlvo,
+      filtrarOrgao: orgaoFiltro
+    },
     registros_encontrados: 0,
-    registros_inseridos: 0,
-    registros_filtrados: 0
+    registros_filtrados: 0,
+    registros_inseridos: 0
   };
 
   try {
     const { data, requestUrl } = await scrapeRemuneracoes({
       competencia,
       codigoInstituicao,
-      codigoOrgao: codigoOrgao || '',
       nomeServidor,
       quantidade: 100
     });
@@ -131,16 +146,24 @@ export async function syncPorNome({
     log.registros_encontrados = data.length;
     log.parametros.request_url = requestUrl;
 
+    let filtradas = data;
+    if (filtrarNomeAlvo) {
+      filtradas = filtradas.filter(
+        (item) =>
+          nomeCasaPermissivo(item.funcionario, filtrarNomeAlvo) ||
+          similaridadeNome(filtrarNomeAlvo, item.funcionario) >= similaridadeMin
+      );
+    }
+    if (orgaoFiltro) {
+      filtradas = filtradas.filter(
+        (item) => String(item.codigo_orgao) === orgaoFiltro
+      );
+    }
+    log.registros_filtrados = filtradas.length;
+
     let inseridos = [];
-    if (data.length > 0) {
-      let brutos = data;
-      if (filtrarNomeAlvo) {
-        brutos = data.filter(
-          (item) => similaridadeNome(filtrarNomeAlvo, item.funcionario) >= similaridadeMin
-        );
-        log.registros_filtrados = brutos.length;
-      }
-      const registros = brutos.map(transformar).filter((r) => r.matricula);
+    if (filtradas.length > 0) {
+      const registros = filtradas.map(transformar).filter((r) => r.matricula);
       if (registros.length > 0) {
         const { error, data: ins } = await sb()
           .from('folha_pmsl')

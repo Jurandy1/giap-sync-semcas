@@ -37,6 +37,31 @@ export function tokensNome(nome) {
 }
 
 /**
+ * Sufixos/partículas descartados na comparação permissiva:
+ * `JR` vs `JUNIOR`, sobrenomes duplicados, preposições.
+ */
+export const SUFIXOS_IGNORADOS = new Set([
+  'JR', 'JUNIOR', 'FILHO', 'NETO', 'SOBRINHO',
+  'DE', 'DA', 'DO', 'DAS', 'DOS', 'E', 'DI', 'DU'
+]);
+
+/**
+ * Casamento permissivo: verdadeiro se todos os tokens não-triviais de A
+ * aparecem em B (ou vice-versa), ignorando `SUFIXOS_IGNORADOS`.
+ * Captura casos como `JURANDY SOARES SANTANA JR` vs `JURANDY SOARES SANTANA JUNIOR`.
+ */
+export function nomeCasaPermissivo(a, b) {
+  const ta = tokensNome(a).filter((t) => !SUFIXOS_IGNORADOS.has(t));
+  const tb = tokensNome(b).filter((t) => !SUFIXOS_IGNORADOS.has(t));
+  if (!ta.length || !tb.length) return false;
+  const setA = new Set(ta);
+  const setB = new Set(tb);
+  const aInB = ta.every((t) => setB.has(t));
+  const bInA = tb.every((t) => setA.has(t));
+  return aInB || bInA;
+}
+
+/**
  * Similaridade de nomes (0–1) por tokens em comum.
  * Exige que o menor nome tenha quase todos os tokens no maior
  * (evita casar "JOAO" com "JOAO PEDRO SILVA" sem mais evidência).
