@@ -254,9 +254,13 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao }) {
       const debugNomes = [];
       for (let i = 0; i < buscasNome.length; i++) {
         const item = buscasNome[i];
-        const variantes = (item.variantes && item.variantes.length)
-          ? item.variantes
-          : [item.busca];
+        // Sem matrícula: apenas nome completo (1 scrape), como no portal:
+        // nome_servidor=NOME+COMPLETO&quantidade=1&codigo_orgao=
+        const variantes = !item.tem_matricula
+          ? [item.busca || (item.variantes && item.variantes[0])].filter(Boolean)
+          : (item.variantes && item.variantes.length)
+            ? item.variantes
+            : [item.busca];
         let bruto = 0;
         let posFiltro = 0;
         let inseridos = 0;

@@ -92,8 +92,8 @@ export function similaridadeNome(a, b) {
 
 /**
  * Nome para busca no GIAP — nome completo normalizado.
- * O portal (Dados Abertos) aceita nome completo em nome_servidor, ex.:
- * JURANDY SOARES SANTANA JUNIOR → acha o registro certo.
+ * Igual ao Portal Dados Abertos:
+ * nome_servidor=JURANDY+SOARES+SANTANA+JUNIOR&quantidade=1&codigo_orgao=
  */
 export function nomeBuscaGiap(nome) {
   const tokens = tokensNome(nome);
@@ -102,9 +102,8 @@ export function nomeBuscaGiap(nome) {
 }
 
 /**
- * Variantes de busca: nome completo primeiro; se falhar, tenta sem partículas
- * (DA/DE/DOS), depois com tokens curtos fundidos ("CONCEI CAO" → "CONCEICAO"),
- * depois primeiro+último sobrenome.
+ * Variantes para quem JÁ tem matrícula (só completar folha).
+ * Quem NÃO tem matrícula deve usar só `nomeBuscaGiap` (nome completo).
  */
 export function variantesBuscaGiap(nome) {
   const tokens = tokensNome(nome);
@@ -117,6 +116,7 @@ export function variantesBuscaGiap(nome) {
     if (v && !out.includes(v)) out.push(v);
   };
 
+  // Sempre nome completo primeiro (é o que o portal acerta)
   add(tokens.join(' '));
 
   const semPart = tokens.filter((t) => !particulas.has(t));
@@ -124,68 +124,22 @@ export function variantesBuscaGiap(nome) {
     add(semPart.join(' '));
   }
 
-  // Funde tokens curtos (<=3 chars, exceto partículas) com o anterior:
-  // "CONCEI CAO" → "CONCEICAO". Cobre fragmentação por erro de digitação.
+  // Funde tokens curtos ("CONCEI CAO" → "CONCEICAO")
   const fundido = [];
   for (const t of tokens) {
-    if (
-      t.length <= 3 &&
-      !particulas.has(t) &&
-      fundido.length > 0
-    ) {
+    if (t.length <= 3 && !particulas.has(t) && fundido.length > 0) {
       fundido[fundido.length - 1] += t;
     } else {
       fundido.push(t);
     }
   }
-  // Portal parece exigir partículas na string de busca — mantém "DO" e cia.
   if (fundido.join(' ') !== tokens.join(' ')) {
     add(fundido.join(' '));
   }
-  const fundidoSemPart = fundido.filter((t) => !particulas.has(t));
-  if (fundidoSemPart.length >= 2) {
-    add(fundidoSemPart.join(' '));
-  }
 
-  // Primeiro + último sobrenome — ignora sufixos como JR/JUNIOR/FILHO/NETO.
-  const semSufixos = semPart.filter((t) => !SUFIXOS_IGNORADOS.has(t));
-  const alvoPU = semSufixos.length >= 2 ? semSufixos : semPart;
-  if (alvoPU.length >= 3) {
-    add(`${alvoPU[0]} ${alvoPU[alvoPU.length - 1]}`);
-  } else if (alvoPU.length === 2 && semPart.length >= 3) {
-    // Só emite se a versão com sufixos era mais longa (senão duplica variante 0)
-    add(`${alvoPU[0]} ${alvoPU[1]}`);
-  }
-
-  // Último recurso: token mais raro sozinho. A busca do GIAP é substring
-  // (não só prefixo), então "THAYLLANNA" acha a servidora mesmo com o
-  // sobrenome abreviado/errado no RH. O filtro de similaridade pós-scrape
-  // segura os homônimos.
-  const raros = fundido.filter(
-    (t) =>
-      !particulas.has(t) &&
-      !SUFIXOS_IGNORADOS.has(t) &&
-      !NOMES_COMUNS.has(t) &&
-      t.length >= 5
-  );
-  if (raros.length) {
-    add(raros.reduce((a, b) => (b.length > a.length ? b : a)));
-  }
-
+  // NÃO usa token único (ARIADNA, AROUCHE) — puxa homônimos errados.
   return out;
 }
-
-/** Nomes/sobrenomes frequentes demais pra busca de token único. */
-const NOMES_COMUNS = new Set([
-  'MARIA', 'JOSE', 'JOAO', 'ANTONIO', 'ANTONIA', 'FRANCISCO', 'FRANCISCA',
-  'CARLOS', 'PAULO', 'PEDRO', 'LUCAS', 'MARCOS', 'RAIMUNDO', 'RAIMUNDA',
-  'MANOEL', 'MANUEL', 'FATIMA', 'LOURDES', 'CONCEICAO', 'APARECIDA',
-  'SILVA', 'SANTOS', 'SOUSA', 'SOUZA', 'OLIVEIRA', 'LIMA', 'COSTA',
-  'PEREIRA', 'FERREIRA', 'RODRIGUES', 'ALMEIDA', 'NASCIMENTO', 'ARAUJO',
-  'RIBEIRO', 'CARVALHO', 'GOMES', 'MARTINS', 'BARBOSA', 'ALVES', 'MORAES',
-  'MORAIS', 'CASTRO', 'ANDRADE', 'MENDES', 'FREITAS', 'CARDOSO', 'RAMOS',
-  'GONCALVES', 'DIAS', 'MOREIRA', 'NUNES', 'MARQUES', 'MACHADO', 'VIEIRA'
-]);
 
 /**
  * Converte data do GIAP (DD-MM-YYYY, DD/MM/YYYY ou ISO) pra YYYY-MM-DD.

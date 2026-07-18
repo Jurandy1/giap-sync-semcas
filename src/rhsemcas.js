@@ -549,9 +549,8 @@ export async function enriquecerFuncionarios({
 }
 
 /**
- * Elegíveis (não terceirizados) ainda ausentes da folha da competência —
- * com ou sem matrícula. Sem matrícula vem primeiro (prioridade: preencher).
- * Cada item traz variantes de prefixo — o GIAP é LIKE 'texto%', não match exato.
+ * Elegíveis (não terceirizados) ainda ausentes da folha da competência.
+ * Sem matrícula: busca SÓ pelo nome completo (como no Portal Dados Abertos).
  */
 export async function listarBuscasNomePendentes(competencia) {
   const folha = await carregarFolhaCompetencia(competencia);
@@ -584,7 +583,9 @@ export async function listarBuscasNomePendentes(competencia) {
     if (!nn || nomesFolha.has(nn)) continue;
     if (tokensLen(hr.nome) < 2) continue;
 
-    const variantes = variantesBuscaGiap(hr.nome);
+    const variantes = !temMatricula
+      ? [nomeBuscaGiap(hr.nome)].filter(Boolean) // sem matrícula: SÓ nome completo
+      : variantesBuscaGiap(hr.nome);
     if (!variantes.length) continue;
 
     // Dedup por nome normalizado (não pela 1ª variante)

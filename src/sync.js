@@ -169,15 +169,19 @@ export async function syncPorNome({
   let nomesRetornadosAmostra = null;
 
   try {
+    // Busca de 1 pessoa (filtrarNomeAlvo): quantidade=1 como no portal
+    // (competencia + instituicao + nome completo + codigo_orgao vazio).
+    const qtd = filtrarNomeAlvo ? 1 : 100;
     const { data, requestUrl, raw } = await scrapeRemuneracoes({
       competencia,
       codigoInstituicao,
       nomeServidor,
-      quantidade: 100
+      quantidade: qtd
     });
 
     log.registros_encontrados = data.length;
     log.parametros.request_url = requestUrl;
+    log.parametros.quantidade = qtd;
     if (data.length === 0) {
       rawAmostra = String(raw || '').slice(0, 200);
     } else {
