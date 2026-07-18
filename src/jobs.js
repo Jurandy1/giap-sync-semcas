@@ -12,8 +12,8 @@ import {
 import { competenciaAtual } from './utils.js';
 import { closeBrowser } from './scraper.js';
 
-/** Limite de buscas por nome completo (Render free ~512MB). */
-const MAX_BUSCAS_NOME = Math.max(0, Number(process.env.GIAP_MAX_BUSCAS_NOME || 25));
+/** Limite de buscas por nome completo (Render free ~512MB). Nome completo = 1 scrape. */
+const MAX_BUSCAS_NOME = Math.max(0, Number(process.env.GIAP_MAX_BUSCAS_NOME || 60));
 
 const running = new Map(); // jobId -> promise
 
@@ -147,7 +147,8 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao }) {
       }
       for (let i = 0; i < buscasNome.length; i++) {
         const item = buscasNome[i];
-        // GIAP = LIKE prefixo. Nome completo zera; tenta 1º+último, depois 2 tokens, etc.
+        // Portal aceita nome completo (ex.: JURANDY SOARES SANTANA JUNIOR).
+        // Fallback: sem partículas / primeiro+último se o completo vier vazio.
         const variantes = (item.variantes || [item.busca]).filter(Boolean).slice(0, 3);
         let achou = false;
         for (const prefixo of variantes) {
@@ -157,10 +158,12 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao }) {
               nomeServidor: prefixo,
               codigoInstituicao: 1,
               competencia,
-              codigoOrgao: ''
+              codigoOrgao: '',
+              filtrarNomeAlvo: item.nome
             });
             extrasNomes += r.registros_inseridos || 0;
-            if ((r.registros_encontrados || 0) > 0) {
+            // Só conta hit se gravou alguém com nome parecido com o do RH
+            if ((r.registros_inseridos || 0) > 0) {
               nomesEncontrados++;
               achou = true;
               break;

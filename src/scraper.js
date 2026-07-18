@@ -204,7 +204,8 @@ export async function scrapeRemuneracoes({
         apex.item(ids.codigoOrgao).setValue('');
       }
       if (params.nomeServidor !== '' && params.nomeServidor != null) {
-        apex.item(ids.nomeServidor).setValue(params.nomeServidor);
+        // Portal espera nome completo em maiúsculas (ex.: JURANDY SOARES SANTANA JUNIOR)
+        apex.item(ids.nomeServidor).setValue(String(params.nomeServidor).trim());
       } else {
         apex.item(ids.nomeServidor).setValue('');
       }

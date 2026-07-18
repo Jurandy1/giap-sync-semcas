@@ -56,46 +56,41 @@ export function similaridadeNome(a, b) {
   return cobertura * 0.85 + tamanho * 0.15;
 }
 
-const PARTICULAS_NOME = new Set(['DA', 'DE', 'DO', 'DAS', 'DOS', 'E', 'DI', 'DU']);
-
 /**
- * Nome "forte" para busca no GIAP (1ª tentativa).
- * O portal usa LIKE prefixo — nome completo demais costuma zerar o resultado.
+ * Nome para busca no GIAP — nome completo normalizado.
+ * O portal (Dados Abertos) aceita nome completo em nome_servidor, ex.:
+ * JURANDY SOARES SANTANA JUNIOR → acha o registro certo.
  */
 export function nomeBuscaGiap(nome) {
-  const variantes = variantesBuscaGiap(nome);
-  return variantes[0] || null;
+  const tokens = tokensNome(nome);
+  if (!tokens.length) return null;
+  return tokens.join(' ');
 }
 
 /**
- * Variantes de prefixo para o GIAP (LIKE 'texto%').
- * Ordem: mais específico → mais curto. Exemplos do portal usam 1 token
- * ("SANTANA", "JURANDY"); nome completo com 4 tokens quase sempre volta vazio.
+ * Variantes de busca: nome completo primeiro; se falhar, tenta sem partículas
+ * (DA/DE/DOS) e depois primeiro+último sobrenome.
  */
 export function variantesBuscaGiap(nome) {
   const tokens = tokensNome(nome);
   if (!tokens.length) return [];
 
+  const particulas = new Set(['DA', 'DE', 'DO', 'DAS', 'DOS', 'E', 'DI', 'DU']);
   const out = [];
   const add = (s) => {
     const v = String(s || '').trim();
     if (v && !out.includes(v)) out.push(v);
   };
 
-  const semPart = tokens.filter((t) => !PARTICULAS_NOME.has(t));
-  const primeiro = tokens[0];
-  const sobrenomes = semPart.slice(1);
+  add(tokens.join(' '));
 
-  // 1) primeiro + último sobrenome (melhor custo/benefício no LIKE prefix)
-  if (sobrenomes.length) add(`${primeiro} ${sobrenomes[sobrenomes.length - 1]}`);
-
-  // 2) primeiros 2 tokens (ex.: MARIA JOSE)
-  if (tokens.length >= 2) add(tokens.slice(0, 2).join(' '));
-
-  // 3) primeiros 3 (quando o 2 ainda for genérico)
-  if (tokens.length >= 3) add(tokens.slice(0, 3).join(' '));
-
-  // Não usa só o 1º nome aqui: estoura o limite de 100 do portal e gasta RAM.
+  const semPart = tokens.filter((t) => !particulas.has(t));
+  if (semPart.length >= 2 && semPart.join(' ') !== tokens.join(' ')) {
+    add(semPart.join(' '));
+  }
+  if (semPart.length >= 3) {
+    add(`${semPart[0]} ${semPart[semPart.length - 1]}`);
+  }
 
   return out;
 }

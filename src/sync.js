@@ -1,5 +1,10 @@
 import { scrapeRemuneracoes } from './scraper.js';
-import { normalizarCPF, normalizarNome, parseDataBR } from './utils.js';
+import {
+  normalizarCPF,
+  normalizarNome,
+  parseDataBR,
+  similaridadeNome
+} from './utils.js';
 import { getSupabase } from './supabase.js';
 
 function sb() {
@@ -93,17 +98,27 @@ export async function syncPorOrgao({ codigoOrgao, codigoInstituicao = 1, compete
 }
 
 /**
- * Puxa servidores por nome (LIKE prefix no GIAP) e persiste.
+ * Puxa servidores por nome e persiste.
+ * @param {string} [filtrarNomeAlvo] se informado (busca de 1 pessoa), só grava
+ *   quem tiver nome bem parecido — evita poluir a folha com homônimos de prefixo curto.
  */
-export async function syncPorNome({ nomeServidor, codigoInstituicao = 1, competencia, codigoOrgao = '' }) {
+export async function syncPorNome({
+  nomeServidor,
+  codigoInstituicao = 1,
+  competencia,
+  codigoOrgao = '',
+  filtrarNomeAlvo = null,
+  similaridadeMin = 0.9
+} = {}) {
   const inicio = Date.now();
   const log = {
     tipo: 'nome',
-    parametros: { nomeServidor, codigoInstituicao, competencia, codigoOrgao },
+    parametros: { nomeServidor, codigoInstituicao, competencia, codigoOrgao, filtrarNomeAlvo },
     registros_encontrados: 0,
-    registros_inseridos: 0
+    registros_inseridos: 0,
+    registros_filtrados: 0
   };
-  
+
   try {
     const { data, requestUrl } = await scrapeRemuneracoes({
       competencia,
@@ -112,24 +127,33 @@ export async function syncPorNome({ nomeServidor, codigoInstituicao = 1, compete
       nomeServidor,
       quantidade: 100
     });
-    
+
     log.registros_encontrados = data.length;
     log.parametros.request_url = requestUrl;
-    
+
     let inseridos = [];
     if (data.length > 0) {
-      const registros = data.map(transformar).filter(r => r.matricula);
-      const { error, data: ins } = await sb()
-        .from('folha_pmsl')
-        .upsert(registros, {
-          onConflict: 'competencia,matricula,codigo_instituicao'
-        })
-        .select('id, matricula, funcionario, cpf, lotacao');
-      if (error) throw error;
-      inseridos = ins || [];
-      log.registros_inseridos = inseridos.length;
+      let brutos = data;
+      if (filtrarNomeAlvo) {
+        brutos = data.filter(
+          (item) => similaridadeNome(filtrarNomeAlvo, item.funcionario) >= similaridadeMin
+        );
+        log.registros_filtrados = brutos.length;
+      }
+      const registros = brutos.map(transformar).filter((r) => r.matricula);
+      if (registros.length > 0) {
+        const { error, data: ins } = await sb()
+          .from('folha_pmsl')
+          .upsert(registros, {
+            onConflict: 'competencia,matricula,codigo_instituicao'
+          })
+          .select('id, matricula, funcionario, cpf, lotacao');
+        if (error) throw error;
+        inseridos = ins || [];
+        log.registros_inseridos = inseridos.length;
+      }
     }
-    
+
     log.duracao_ms = Date.now() - inicio;
     await logSync(log);
     return { success: true, resultado: inseridos, ...log };
