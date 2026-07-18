@@ -24,6 +24,20 @@ function ehFolhaSemcas(item) {
   );
 }
 
+function matKey(m) {
+  if (m == null || m === '') return '';
+  const digits = String(m).replace(/\D/g, '');
+  const s = digits || String(m).trim();
+  const stripped = s.replace(/^0+/, '');
+  return stripped || '0';
+}
+
+function matLiberada(matsOk, matricula) {
+  if (!matsOk?.size) return false;
+  const k = matKey(matricula);
+  return !!(k && matsOk.has(k));
+}
+
 /**
  * Converte item bruto do GIAP no formato da tabela folha_pmsl.
  */
@@ -169,7 +183,11 @@ export async function syncPorNome({
   const inicio = Date.now();
   const orgaoFiltro = filtrarOrgao ? String(filtrarOrgao) : null;
   const matsOk = matriculasOutrosOrgaosOk
-    ? new Set([...matriculasOutrosOrgaosOk].map((m) => String(m).trim()).filter(Boolean))
+    ? new Set(
+        [...matriculasOutrosOrgaosOk]
+          .map((m) => matKey(m))
+          .filter(Boolean)
+      )
     : null;
   const log = {
     tipo: 'nome',
@@ -210,22 +228,25 @@ export async function syncPorNome({
     }
 
     let filtradas = data;
-    if (filtrarNomeAlvo) {
-      filtradas = filtradas.filter(
-        (item) =>
-          nomeCasaPermissivo(item.funcionario, filtrarNomeAlvo) ||
-          similaridadeNome(filtrarNomeAlvo, item.funcionario) >= similaridadeMin
+  // Também aceita linha cuja matrícula está liberada (RH / Cedido),
+  // mesmo se o filtro de nome falhar por grafia estranha no portal.
+  if (filtrarNomeAlvo || matsOk?.size) {
+    filtradas = data.filter((item) => {
+      if (matLiberada(matsOk, item.matricula)) return true;
+      if (!filtrarNomeAlvo) return false;
+      return (
+        nomeCasaPermissivo(item.funcionario, filtrarNomeAlvo) ||
+        similaridadeNome(filtrarNomeAlvo, item.funcionario) >= similaridadeMin
       );
-      // SEMCAS employee ≠ homônimo de SEMOSP/SEMUS etc.
-      // Outras secretarias só se for Cedido/Recebido (matrícula liberada).
-      if (apenasSemcas) {
-        filtradas = filtradas.filter((item) => {
-          if (ehFolhaSemcas(item)) return true;
-          const mat = item.matricula != null ? String(item.matricula).trim() : '';
-          return !!(matsOk && mat && matsOk.has(mat));
-        });
-      }
+    });
+    // SEMCAS employee ≠ homônimo de SEMOSP/SEMUS etc.
+    // Outras secretarias só se matrícula liberada (RH puxado / Cedido).
+    if (apenasSemcas) {
+      filtradas = filtradas.filter(
+        (item) => ehFolhaSemcas(item) || matLiberada(matsOk, item.matricula)
+      );
     }
+  }
     if (orgaoFiltro) {
       filtradas = filtradas.filter(
         (item) => String(item.codigo_orgao) === orgaoFiltro

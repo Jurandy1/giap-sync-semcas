@@ -148,6 +148,9 @@ app.post('/sync/nome', async (req, res) => {
     const ced = await carregarCedenciasAtuais();
     const mat = matricula != null ? String(matricula).trim() : '';
     const ehCedido = !!(mat && ced.mats.has(mat));
+    // Matrícula vinda do RH (puxar 1 a 1): sempre libera essa mat, mesmo se o GIAP
+    // vier com outro código de órgão — senão o registro some (ex.: Jurandy).
+    const matsOk = mat ? [mat] : [];
 
     const resultado = await syncPorNome({
       nomeServidor,
@@ -155,8 +158,9 @@ app.post('/sync/nome', async (req, res) => {
       competencia,
       filtrarNomeAlvo: filtrarNomeAlvo || nomeServidor,
       apenasSemcas: apenasSemcas !== false,
-      // Outras secretarias (SEMOSP etc.) só Cedidos/Recebidos
-      matriculasOutrosOrgaosOk: ehCedido ? [mat] : []
+      matriculasOutrosOrgaosOk: matsOk,
+      // diagnóstico leve
+      meta: { ehCedido, matriculaRh: mat || null }
     });
     // Fecha Chrome após 1 nome — evita acumular RAM no Render free
     await closeBrowser().catch(() => {});

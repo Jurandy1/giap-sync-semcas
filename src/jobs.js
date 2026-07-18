@@ -345,13 +345,12 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao, filt
                 codigoInstituicao: 1,
                 competencia,
                 filtrarNomeAlvo: item.nome,
-                // SEMCAS: só órgão 9. Outras secretarias = só Cedidos/Recebidos.
+                // Com matrícula do RH: libera essa mat mesmo fora do órgão 9.
+                // Sem matrícula: só SEMCAS (homônimos de outras secs ficam de fora).
                 apenasSemcas: true,
-                matriculasOutrosOrgaosOk: ehCedido
-                  ? (item.matricula
-                    ? [String(item.matricula).trim()]
-                    : [...cedencias.mats])
-                  : []
+                matriculasOutrosOrgaosOk: item.matricula
+                  ? [String(item.matricula).trim()]
+                  : (ehCedido ? [...cedencias.mats] : [])
               }),
               SCRAPE_WATCHDOG_MS,
               `sync_nome_${busca}`

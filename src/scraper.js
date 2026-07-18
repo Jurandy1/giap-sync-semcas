@@ -27,12 +27,34 @@ const IDS = {
 let browserInstance = null;
 let remPage = null; // página reutilizada (evita reload do portal a cada busca)
 let scrapesDesdeRestart = 0;
+let browserLock = Promise.resolve(); // serializa scrapes (evita 2 Chrome no free tier)
 
 /** Reinicia o Chrome a cada N consultas (free tier: baixo). */
 const BROWSER_RESTART_EVERY = Math.max(
   1,
   Number(process.env.GIAP_BROWSER_RESTART_EVERY || 3)
 );
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function ehErroFrameCedo(err) {
+  const msg = String(err?.message || err || '');
+  return (
+    /main frame too early/i.test(msg) ||
+    /detached Frame/i.test(msg) ||
+    /Target closed/i.test(msg) ||
+    /Session closed/i.test(msg) ||
+    /Protocol error/i.test(msg) ||
+    /Execution context was destroyed/i.test(msg)
+  );
+}
+
+/** Evita dois /sync/nome ao mesmo tempo derrubarem o Chrome. */
+function comLockBrowser(fn) {
+  const run = browserLock.then(() => fn());
+  browserLock = run.catch(() => {});
+  return run;
+}
 
 /** Caminhos comuns de Chrome/Chromium em Docker/Linux (fallback). */
 function resolverExecutablePath() {
@@ -111,7 +133,7 @@ async function getBrowser() {
       '--no-first-run',
       '--metrics-recording-only',
       '--disable-software-rasterizer',
-      '--disable-features=TranslateUI,BlinkGenPropertyTrees',
+      '--disable-features=TranslateUI,BlinkGenPropertyTrees,NetworkServiceInProcess2',
       '--renderer-process-limit=1',
       '--js-flags=--max-old-space-size=96',
       ...(process.env.PUPPETEER_DOCKER === '1'
@@ -156,8 +178,13 @@ async function prepararPaginaLeve(page) {
 }
 
 async function loadPortal(page, timeoutMs) {
-  // domcontentloaded é bem mais rápido que networkidle2 no APEX
-  await page.goto(PORTAL_URL, { waitUntil: 'domcontentloaded', timeout: timeoutMs });
+  // networkidle0 costuma travar no APEX; domcontentloaded + wait apex
+  await page.goto(PORTAL_URL, {
+    waitUntil: 'domcontentloaded',
+    timeout: timeoutMs
+  });
+  // Chrome no Docker às vezes ainda não tem main frame estável
+  await sleep(400);
   await page.waitForFunction(
     () => window.apex && window.apex.item && window.apex.item('P6_COMPETENCIA'),
     { timeout: 25000 }
@@ -183,7 +210,7 @@ async function expandirAccordionRem(page) {
     { timeout: 10000 },
     IDS.regionRem
   );
-  await new Promise((r) => setTimeout(r, 300));
+  await sleep(300);
 }
 
 /** Uma página viva do portal — reutilizada entre consultas. */
@@ -192,29 +219,35 @@ async function getRemPage(timeoutMs) {
 
   if (remPage) {
     try {
-      const ok = await remPage.evaluate(
-        () => !!(window.apex && window.apex.item && window.apex.item('P6_COMPETENCIA'))
-      );
-      if (ok) return remPage;
+      if (remPage.isClosed?.()) {
+        remPage = null;
+      } else {
+        const ok = await remPage.evaluate(
+          () => !!(window.apex && window.apex.item && window.apex.item('P6_COMPETENCIA'))
+        );
+        if (ok) return remPage;
+      }
     } catch {
       remPage = null;
     }
   }
 
   const page = await browser.newPage();
+  await sleep(500); // race comum no Render: newPage → goto cedo demais
   await page.setDefaultTimeout(timeoutMs);
   await prepararPaginaLeve(page);
-  await loadPortal(page, timeoutMs);
-  await expandirAccordionRem(page);
+  try {
+    await loadPortal(page, timeoutMs);
+    await expandirAccordionRem(page);
+  } catch (e) {
+    await page.close().catch(() => {});
+    throw e;
+  }
   remPage = page;
   return remPage;
 }
 
-/**
- * Puxa remuneração(ões) filtrando por competência + inst + órgão/nome.
- * Reutiliza a mesma aba do portal (muito mais rápido / menos RAM).
- */
-export async function scrapeRemuneracoes({
+async function scrapeRemuneracoesOnce({
   competencia,
   codigoInstituicao = 1,
   codigoOrgao = '',
@@ -222,8 +255,6 @@ export async function scrapeRemuneracoes({
   quantidade = 100,
   timeoutMs = 60000
 } = {}) {
-  // O portal /remuneracoes zera a resposta quando codigo_orgao é enviado.
-  // Filtramos por órgão no backend (usando row.codigo_orgao no JSON de retorno).
   if (codigoOrgao !== '' && codigoOrgao != null) {
     console.warn(
       '[scraper] codigoOrgao ignorado no portal (retornaria vazio). Filtre pós-scrape. Recebido:',
@@ -234,7 +265,6 @@ export async function scrapeRemuneracoes({
   const page = await getRemPage(timeoutMs);
   scrapesDesdeRestart++;
 
-  // Token pra detectar resultado novo (evita ler resposta anterior)
   const token = `giap_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 
   await page.evaluate(
@@ -271,7 +301,6 @@ export async function scrapeRemuneracoes({
       token
     );
   } catch (err) {
-    // Sem resultado a tempo — devolve vazio em vez de derrubar o job inteiro
     console.warn('[scraper] timeout remuneracoes', nomeServidor || codigoOrgao || '', err.message);
     return { data: [], requestUrl: null, raw: '' };
   }
@@ -285,6 +314,35 @@ export async function scrapeRemuneracoes({
   );
 
   return { data: parseResult(raw), requestUrl, raw };
+}
+
+/**
+ * Puxa servidores por remuneração. Em erro de frame/Chrome no Render, reinicia e tenta de novo.
+ */
+export async function scrapeRemuneracoes(opts = {}) {
+  return comLockBrowser(async () => {
+    const maxTentativas = Math.max(1, Number(process.env.GIAP_SCRAPE_RETRIES || 3));
+    let ultimoErro = null;
+    for (let t = 1; t <= maxTentativas; t++) {
+      try {
+        return await scrapeRemuneracoesOnce(opts);
+      } catch (e) {
+        ultimoErro = e;
+        const msg = e?.message || String(e);
+        console.warn(`[scraper] tentativa ${t}/${maxTentativas} falhou:`, msg);
+        if (!ehErroFrameCedo(e) || t === maxTentativas) break;
+        await closeBrowser().catch(() => {});
+        await sleep(1200 * t);
+      }
+    }
+    if (ehErroFrameCedo(ultimoErro)) {
+      throw new Error(
+        'Portal GIAP ocupado ou Chrome reiniciando no servidor. Aguarde 10–20s e clique em Puxar de novo. ' +
+          `(${ultimoErro?.message || ultimoErro})`
+      );
+    }
+    throw ultimoErro;
+  });
 }
 
 /**
