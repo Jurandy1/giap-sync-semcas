@@ -1,5 +1,6 @@
 # Força o Render a usar Docker (imagem oficial do Puppeteer com Chrome).
 # Sem isso, o deploy Node nativo sobe sem o Chrome e o job falha.
+# Plano free = 512MB — lotes curtos + restart frequente do Chrome.
 services:
   - type: web
     name: giap-sync-semcas
@@ -13,9 +14,13 @@ services:
       - key: NODE_ENV
         value: production
       - key: NODE_OPTIONS
-        value: "--max-old-space-size=192"
+        value: "--max-old-space-size=160 --expose-gc"
       - key: GIAP_MAX_BUSCAS_NOME
-        value: "20"
+        value: "8"
+      - key: GIAP_MAX_VARIANTES_NOME
+        value: "1"
       - key: GIAP_BROWSER_RESTART_EVERY
-        value: "20"
+        value: "3"
+      - key: GIAP_CLOSE_BROWSER_EVERY_NOME
+        value: "2"
       # API_KEY, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY: cadastre no Dashboard

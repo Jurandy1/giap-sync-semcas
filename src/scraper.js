@@ -28,10 +28,10 @@ let browserInstance = null;
 let remPage = null; // página reutilizada (evita reload do portal a cada busca)
 let scrapesDesdeRestart = 0;
 
-/** Reinicia o Chrome a cada N consultas (com página reutilizada pode ser maior). */
+/** Reinicia o Chrome a cada N consultas (free tier: baixo). */
 const BROWSER_RESTART_EVERY = Math.max(
   1,
-  Number(process.env.GIAP_BROWSER_RESTART_EVERY || 20)
+  Number(process.env.GIAP_BROWSER_RESTART_EVERY || 3)
 );
 
 /** Caminhos comuns de Chrome/Chromium em Docker/Linux (fallback). */
@@ -110,7 +110,10 @@ async function getBrowser() {
       '--mute-audio',
       '--no-first-run',
       '--metrics-recording-only',
-      '--js-flags=--max-old-space-size=128',
+      '--disable-software-rasterizer',
+      '--disable-features=TranslateUI,BlinkGenPropertyTrees',
+      '--renderer-process-limit=1',
+      '--js-flags=--max-old-space-size=96',
       ...(process.env.PUPPETEER_DOCKER === '1'
         ? ['--single-process', '--no-zygote']
         : [])

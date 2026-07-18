@@ -880,7 +880,7 @@ export async function buscarDemissoesVinculos({
     items: []
   };
 
-  const MAX_SCRAPE = Math.max(0, Number(process.env.GIAP_MAX_BUSCAS_NOME || 20));
+  const MAX_SCRAPE = Math.max(0, Number(process.env.GIAP_MAX_BUSCAS_NOME || 8));
   let scrapesFeitos = 0;
 
   for (let i = 0; i < alvos.length; i++) {
@@ -952,22 +952,11 @@ export async function buscarDemissoesVinculos({
         demissao: hit.demissao,
         competencia_folha: hit.competencia,
         acao: 'demissao_encontrada',
-        status: dryRun ? 'pending' : 'applied'
+        status: 'pending'
       };
       if (relatorio.items.length < 80) relatorio.items.push(item);
 
-      if (!dryRun) {
-        const { error: errRpc } = await sb().rpc('fn_exonerar_funcionario', {
-          p_funcionario_id: hr.id,
-          p_data_exoneracao: hit.demissao,
-          p_motivo: `GIAP demissão ${hit.demissao} (competência ${hit.competencia})`
-        });
-        if (errRpc) {
-          item.status = 'error';
-          item.erro = errRpc.message;
-        }
-      }
-
+      // Nunca exonera automático — só ação manual no Relatório API / menu Exonerados
       if (jobId) {
         await sb().from('giap_job_items').insert({
           job_id: jobId,
@@ -977,8 +966,8 @@ export async function buscarDemissoesVinculos({
           acao: 'demissao_encontrada',
           before_data: { ativo: true },
           after_data: { demissao: hit.demissao, competencia: hit.competencia },
-          status: item.status,
-          erro: item.erro || null
+          status: 'pending',
+          erro: null
         });
       }
     } else {

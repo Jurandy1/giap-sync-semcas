@@ -147,9 +147,12 @@ app.post('/sync/nome', async (req, res) => {
       competencia,
       filtrarNomeAlvo: filtrarNomeAlvo || nomeServidor
     });
+    // Fecha Chrome após 1 nome — evita acumular RAM no Render free
+    await closeBrowser().catch(() => {});
     res.json(resultado);
   } catch (e) {
     console.error('[/sync/nome]', e);
+    await closeBrowser().catch(() => {});
     res.status(500).json({ error: e.message });
   }
 });
@@ -255,6 +258,7 @@ app.post('/jobs', async (req, res) => {
       'enriquecer',
       'exoneracoes',
       'sync_orgao',
+      'sync_folha',
       'buscar_demissoes'
     ];
     if (!tiposOk.includes(tipo)) {

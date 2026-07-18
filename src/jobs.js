@@ -13,8 +13,15 @@ import {
 import { competenciaAtual } from './utils.js';
 import { closeBrowser } from './scraper.js';
 
-/** Limite de buscas por nome por execução (Railway free). Página reutilizada ≈ 1 scrape leve. */
-const MAX_BUSCAS_NOME = Math.max(0, Number(process.env.GIAP_MAX_BUSCAS_NOME || 40));
+/** Limite de buscas por nome por execução (Render free 512MB). */
+const MAX_BUSCAS_NOME = Math.max(0, Number(process.env.GIAP_MAX_BUSCAS_NOME || 8));
+/** No free tier: 1 = só nome completo (evita 5 scrapes/pessoa). */
+const MAX_VARIANTES_NOME = Math.max(1, Number(process.env.GIAP_MAX_VARIANTES_NOME || 1));
+/** Fecha o Chrome a cada N pessoas (libera RAM). */
+const CLOSE_BROWSER_EVERY_NOME = Math.max(
+  1,
+  Number(process.env.GIAP_CLOSE_BROWSER_EVERY_NOME || 2)
+);
 
 /** Varredura A–Z desligada por padrão — busca por nome completo é mais precisa.
  *  Reative com GIAP_SYNC_LETRAS=1 se precisar engordar a folha em massa. */
@@ -180,8 +187,8 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao, filt
       return;
     }
 
-    // 1) Sync órgão (sempre no ciclo completo / sync_orgao)
-    if (tipo === 'ciclo_completo' || tipo === 'sync_orgao') {
+    // 1) Sync órgão (ciclo / sync_orgao / sync_folha = só grava buscas)
+    if (tipo === 'ciclo_completo' || tipo === 'sync_orgao' || tipo === 'sync_folha') {
       await setProgress(0, 0, 'sync_orgao');
       const syncRes = await comTimeout(
         syncPorOrgao({
@@ -306,11 +313,11 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao, filt
       const debugNomes = [];
       for (let i = 0; i < buscasNome.length; i++) {
         const item = buscasNome[i];
-        // Sem matrícula: nome completo e prefixos longos (nunca 1 token).
-        // Com matrícula: mesmas variantes (completar folha).
-        const variantes = (item.variantes && item.variantes.length)
+        // Free tier: só 1ª variante (nome completo). Prefixo sobra p/ "Puxar na API".
+        const variantesRaw = (item.variantes && item.variantes.length)
           ? item.variantes
           : [item.busca].filter(Boolean);
+        const variantes = variantesRaw.slice(0, MAX_VARIANTES_NOME);
         let bruto = 0;
         let posFiltro = 0;
         let inseridos = 0;
@@ -396,17 +403,24 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao, filt
           }
         }
 
-        if (i % 3 === 0 || i === buscasNome.length - 1) {
-          await updateJob(jobId, {
-            progresso_pct: Math.round(
-              18 + ((i + 1) / Math.max(buscasNome.length, 1)) * 12
-            ),
-            resumo: {
-              ...resumo,
-              etapa: `sync_nome_${i + 1}/${buscasNome.length}`
-            }
-          });
+        // Libera RAM do Chrome com frequência (plano free 512MB)
+        if ((i + 1) % CLOSE_BROWSER_EVERY_NOME === 0) {
+          await closeBrowser().catch(() => {});
         }
+
+        await updateJob(jobId, {
+          progresso_pct: Math.round(
+            18 + ((i + 1) / Math.max(buscasNome.length, 1)) * 12
+          ),
+          processados: i + 1,
+          total: buscasNome.length,
+          resumo: {
+            ...resumo,
+            etapa: `sync_nome_${i + 1}/${buscasNome.length}`,
+            max_buscas: MAX_BUSCAS_NOME,
+            max_variantes: MAX_VARIANTES_NOME
+          }
+        });
       }
 
       // Fecha Chrome antes do enriquecimento (só Node + Supabase)
@@ -440,7 +454,28 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao, filt
         success: syncRes.success
       };
       await updateJob(jobId, { progresso_pct: 30, resumo: { ...resumo, etapa: 'sync_ok' } });
-      if (tipo === 'sync_orgao') {
+      if (tipo === 'sync_orgao' || tipo === 'sync_folha') {
+        try {
+          const { data: cfg } = await sb()
+            .from('giap_config')
+            .select('competencias_buscadas')
+            .eq('id', 1)
+            .maybeSingle();
+          const lista = Array.isArray(cfg?.competencias_buscadas)
+            ? [...cfg.competencias_buscadas]
+            : [];
+          if (!lista.includes(competencia)) lista.push(competencia);
+          lista.sort((a, b) => b - a);
+          await sb()
+            .from('giap_config')
+            .upsert({
+              id: 1,
+              competencias_buscadas: lista.slice(0, 36),
+              updated_at: new Date().toISOString()
+            });
+        } catch (e) {
+          console.warn('[job] marcar competencia buscada:', e.message);
+        }
         await updateJob(jobId, {
           status: 'done',
           progresso_pct: 100,
@@ -454,13 +489,13 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao, filt
       }
     }
 
-    // 2) Enriquecer
+    // 2) Enriquecer — no ciclo_completo só simula (aplicação é manual na UI)
     if (tipo === 'ciclo_completo' || tipo === 'enriquecer') {
       await setProgress(30, 0, 'enriquecer');
       let lastEnrichPct = -1;
       const enrich = await enriquecerFuncionarios({
         competencia,
-        dryRun,
+        dryRun: tipo === 'ciclo_completo' ? true : dryRun,
         jobId,
         matchesBusca: matriculasBusca,
         onProgress: async ({ processados, total, pct }) => {
@@ -500,16 +535,16 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao, filt
       }
     }
 
-    // 3) Exonerações + revisão
-    if (tipo === 'ciclo_completo' || tipo === 'exoneracoes') {
+    // 3) Exonerações — NUNCA no ciclo_completo (pessoa pode reaparecer noutro cargo).
+    //    Só job explícito tipo=exoneracoes, e mesmo assim só com filtros.aplicar===true.
+    if (tipo === 'exoneracoes') {
+      const aplicar = !!(filtros && filtros.aplicar === true);
       await setProgress(70, 0, 'exoneracoes');
       const exo = await aplicarExoneracoes({
         competencia,
-        dryRun,
+        dryRun: !aplicar || dryRun,
         jobId,
-        // No ciclo completo, ausência só vale p/ quem foi pesquisado por nome;
-        // no job avulso de exonerações (sem fase de busca) mantém comportamento antigo
-        verificadosIds: verificadosNome ? [...verificadosNome] : null,
+        verificadosIds: null,
         onProgress: async ({ processados, total, pct }) => {
           await updateJob(jobId, {
             processados,
@@ -524,7 +559,13 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao, filt
         revisao_ausencia: exo.revisao_ausencia,
         ausencia_nao_verificada: exo.ausencia_nao_verificada,
         ausencia_pausada_folha_magra: exo.ausencia_pausada_folha_magra,
-        folha_registros: exo.folha_registros
+        folha_registros: exo.folha_registros,
+        aplicar
+      };
+    } else if (tipo === 'ciclo_completo') {
+      resumo.exoneracoes = {
+        pulado: true,
+        motivo: 'Exoneração só manual no RHSEMCAS (demissão GIAP pode ser temporária).'
       };
     }
 
