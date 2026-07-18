@@ -7,7 +7,8 @@ import {
   aplicarExoneracoes,
   CODIGO_ORGAO_SEMCAS,
   getSupabase,
-  listarBuscasNomePendentes
+  listarBuscasNomePendentes,
+  buscarDemissoesVinculos
 } from './rhsemcas.js';
 import { competenciaAtual } from './utils.js';
 import { closeBrowser } from './scraper.js';
@@ -87,7 +88,8 @@ export async function criarEExecutarJob({
   modo = 'manual',
   dryRun = false,
   createdBy = null,
-  codigoOrgao = CODIGO_ORGAO_SEMCAS
+  codigoOrgao = CODIGO_ORGAO_SEMCAS,
+  filtros = null
 } = {}) {
   const comp = Number(competencia || competenciaAtual());
 
@@ -105,7 +107,7 @@ export async function criarEExecutarJob({
       progresso_pct: 0,
       total: 0,
       processados: 0,
-      resumo: {},
+      resumo: { filtros: filtros || {} },
       created_by: createdBy
     })
     .select('*')
@@ -113,24 +115,28 @@ export async function criarEExecutarJob({
 
   if (error) throw error;
 
-  const promise = executarJob(job.id, { tipo, competencia: comp, dryRun, codigoOrgao }).catch(
-    (e) => {
-      console.error('[jobs] falha', job.id, e);
-    }
-  );
+  const promise = executarJob(job.id, {
+    tipo,
+    competencia: comp,
+    dryRun,
+    codigoOrgao,
+    filtros: filtros || {}
+  }).catch((e) => {
+    console.error('[jobs] falha', job.id, e);
+  });
   running.set(job.id, promise);
 
   return job;
 }
 
-async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao }) {
+async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao, filtros = {} }) {
   await updateJob(jobId, {
     status: 'running',
     started_at: new Date().toISOString(),
     progresso_pct: 0
   });
 
-  const resumo = {};
+  const resumo = { filtros };
   // Quem foi pesquisado por nome nesta execução — gate da fila de ausência
   let verificadosNome = null;
   // funcionario_id → matrícula única achada pela busca por nome (a busca já
@@ -144,6 +150,35 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao }) {
         resumo: { ...resumo, etapa: label }
       });
     };
+
+    // 0) Busca demissões (comissionados/contratos — sem Efetivo/SP/terceirizado)
+    if (tipo === 'buscar_demissoes') {
+      await setProgress(0, 0, 'buscar_demissoes');
+      const dem = await buscarDemissoesVinculos({
+        competencia,
+        dryRun,
+        jobId,
+        mesesAtras: Number(filtros.mesesAtras || 12),
+        onProgress: async ({ processados, total, pct }) => {
+          await updateJob(jobId, {
+            processados,
+            total,
+            progresso_pct: Math.min(99, Math.round(pct)),
+            resumo: { ...resumo, etapa: 'buscar_demissoes' }
+          });
+        }
+      });
+      resumo.demissoes = dem;
+      await closeBrowser().catch(() => {});
+      await updateJob(jobId, {
+        status: 'done',
+        progresso_pct: 100,
+        finished_at: new Date().toISOString(),
+        resumo: { ...resumo, etapa: 'done' }
+      });
+      running.delete(jobId);
+      return;
+    }
 
     // 1) Sync órgão (sempre no ciclo completo / sync_orgao)
     if (tipo === 'ciclo_completo' || tipo === 'sync_orgao') {
@@ -235,9 +270,25 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao }) {
       verificadosNome = new Set();
       matriculasBusca = new Map();
       try {
-        const todas = await listarBuscasNomePendentes(competencia);
-        // Sem matrícula primeiro (preencher matrícula); dentro do grupo,
-        // nomes mais longos primeiro (prefixo mais específico no GIAP)
+        let todas = await listarBuscasNomePendentes(competencia);
+        const f = filtros || {};
+        const soSemMat = !!f.soSemMatricula;
+        const soSemAdm = !!f.soSemAdmissao;
+        const comMat = !!f.incluirComMatricula;
+        todas = todas.filter((b) => {
+          const semMat = !b.tem_matricula;
+          const semAdm =
+            b.data_admissao == null || String(b.data_admissao).trim() === '';
+          if (comMat) {
+            if (semMat) return true;
+            return soSemAdm ? semAdm : true;
+          }
+          if (soSemMat && soSemAdm) return semMat || semAdm;
+          if (soSemMat) return semMat;
+          if (soSemAdm) return semAdm;
+          return semMat;
+        });
+        // Sem matrícula primeiro; nomes mais longos primeiro
         todas.sort((a, b) => {
           const grupo = Number(a.tem_matricula) - Number(b.tem_matricula);
           if (grupo !== 0) return grupo;

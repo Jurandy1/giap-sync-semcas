@@ -240,10 +240,17 @@ app.post('/jobs', async (req, res) => {
       dryRun = false,
       modo = 'manual',
       createdBy = null,
-      codigoOrgao = CODIGO_ORGAO_SEMCAS
+      codigoOrgao = CODIGO_ORGAO_SEMCAS,
+      filtros = null
     } = req.body;
 
-    const tiposOk = ['ciclo_completo', 'enriquecer', 'exoneracoes', 'sync_orgao'];
+    const tiposOk = [
+      'ciclo_completo',
+      'enriquecer',
+      'exoneracoes',
+      'sync_orgao',
+      'buscar_demissoes'
+    ];
     if (!tiposOk.includes(tipo)) {
       return res.status(400).json({ error: `tipo inválido. Use: ${tiposOk.join(', ')}` });
     }
@@ -255,7 +262,8 @@ app.post('/jobs', async (req, res) => {
       dryRun: !!dryRun,
       modo,
       createdBy,
-      codigoOrgao: String(codigoOrgao)
+      codigoOrgao: String(codigoOrgao),
+      filtros
     });
     res.status(202).json({ ok: true, job });
   } catch (e) {

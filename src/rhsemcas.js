@@ -789,4 +789,198 @@ export async function aplicarExoneracoes({
   return relatorio;
 }
 
+/**
+ * Demissões p/ Comissionados e Contratos (exclui Efetivo, Serviço Prestado e terceirizados).
+ * Cruza folha_pmsl das competências recentes; se faltar, busca nome na competência alvo.
+ */
+export async function buscarDemissoesVinculos({
+  competencia,
+  dryRun = true,
+  jobId = null,
+  mesesAtras = 12,
+  onProgress = null
+} = {}) {
+  const { syncPorNome } = await import('./sync.js');
+
+  const VINCULOS_DEM = new Set(
+    ['COMISSIONADO', 'CONTRATO SEMUS', 'CONTRATO TEMPORARIO'].map(normalizarCategoria)
+  );
+
+  const lots = await selectTudo(() =>
+    sb()
+      .from('funcionario_lotacao')
+      .select('id, funcionario_id, vinculo_id, ativo, data_fim')
+      .eq('ativo', true)
+      .order('id')
+  );
+  const { data: vinculos, error: errV } = await sb().from('vinculos').select('id, categoria');
+  if (errV) throw errV;
+  const catById = new Map(
+    (vinculos || []).map((v) => [v.id, normalizarCategoria(v.categoria)])
+  );
+
+  const idsAlvo = new Set();
+  for (const l of lots || []) {
+    if (l.data_fim) continue;
+    const cat = catById.get(l.vinculo_id);
+    if (cat && VINCULOS_DEM.has(cat)) idsAlvo.add(l.funcionario_id);
+  }
+
+  const funcs = await selectTudo(() =>
+    sb()
+      .from('funcionarios')
+      .select('id, nome, matricula, data_admissao, ativo')
+      .eq('ativo', true)
+      .order('id')
+  );
+  const alvos = (funcs || []).filter((f) => idsAlvo.has(f.id));
+
+  // Competências a vasculhar na folha já baixada
+  const comps = [];
+  let c = Number(competencia);
+  for (let i = 0; i < Math.max(1, mesesAtras); i++) {
+    comps.push(c);
+    let y = Math.floor(c / 100);
+    let m = c % 100;
+    m -= 1;
+    if (m < 1) {
+      m = 12;
+      y -= 1;
+    }
+    c = y * 100 + m;
+  }
+
+  const { data: folhaDem, error: errF } = await sb()
+    .from('folha_pmsl')
+    .select('matricula, funcionario, funcionario_norm, admissao, demissao, competencia, lotacao, codigo_orgao')
+    .in('competencia', comps)
+    .not('demissao', 'is', null);
+  if (errF) throw errF;
+
+  const porMat = new Map();
+  const porNome = new Map();
+  for (const row of folhaDem || []) {
+    if (row.matricula) porMat.set(String(row.matricula).trim(), row);
+    const nn = row.funcionario_norm || normalizarNome(row.funcionario);
+    if (nn && !porNome.has(nn)) porNome.set(nn, row);
+  }
+
+  const relatorio = {
+    competencia,
+    total_alvos: alvos.length,
+    com_demissao: 0,
+    sem_demissao: 0,
+    scrapes: 0,
+    items: []
+  };
+
+  const MAX_SCRAPE = Math.max(0, Number(process.env.GIAP_MAX_BUSCAS_NOME || 20));
+  let scrapesFeitos = 0;
+
+  for (let i = 0; i < alvos.length; i++) {
+    const hr = alvos[i];
+    if (onProgress) {
+      await onProgress({
+        processados: i + 1,
+        total: alvos.length,
+        pct: alvos.length ? Math.round(((i + 1) / alvos.length) * 100) : 100
+      });
+    }
+
+    let hit = null;
+    if (!matriculaVazia(hr.matricula)) {
+      hit = porMat.get(String(hr.matricula).trim()) || null;
+    }
+    if (!hit) {
+      hit = porNome.get(normalizarNome(hr.nome)) || null;
+    }
+
+    // Folha local sem demissão → tenta scrape (limitado) pelo nome completo
+    if (!hit && scrapesFeitos < MAX_SCRAPE && hr.nome) {
+      try {
+        const busca = nomeBuscaGiap(hr.nome);
+        if (busca) {
+          scrapesFeitos++;
+          relatorio.scrapes++;
+          const r = await syncPorNome({
+            nomeServidor: busca,
+            codigoInstituicao: 1,
+            competencia,
+            filtrarNomeAlvo: hr.nome
+          });
+          const comDem = (r.resultado || []).find((x) => x.demissao || x.after_data?.demissao);
+          // resultado do upsert não traz demissao — releitura rápida
+          if ((r.registros_inseridos || 0) > 0 || (r.registros_encontrados || 0) > 0) {
+            const { data: rows } = await sb()
+              .from('folha_pmsl')
+              .select('matricula, funcionario, admissao, demissao, competencia')
+              .eq('competencia', competencia)
+              .eq('funcionario_norm', normalizarNome(hr.nome))
+              .not('demissao', 'is', null)
+              .limit(1);
+            if (rows?.[0]) hit = rows[0];
+            else if (!matriculaVazia(hr.matricula)) {
+              const { data: byMat } = await sb()
+                .from('folha_pmsl')
+                .select('matricula, funcionario, admissao, demissao, competencia')
+                .eq('matricula', String(hr.matricula).trim())
+                .not('demissao', 'is', null)
+                .order('competencia', { ascending: false })
+                .limit(1);
+              if (byMat?.[0]) hit = byMat[0];
+            }
+          }
+          void comDem;
+        }
+      } catch (err) {
+        console.warn('[demissoes] scrape', hr.nome, err.message);
+      }
+    }
+
+    if (hit?.demissao) {
+      relatorio.com_demissao++;
+      const item = {
+        funcionario_id: hr.id,
+        nome: hr.nome,
+        matricula: hr.matricula,
+        demissao: hit.demissao,
+        competencia_folha: hit.competencia,
+        acao: 'demissao_encontrada',
+        status: dryRun ? 'pending' : 'applied'
+      };
+      if (relatorio.items.length < 80) relatorio.items.push(item);
+
+      if (!dryRun) {
+        const { error: errRpc } = await sb().rpc('fn_exonerar_funcionario', {
+          p_funcionario_id: hr.id,
+          p_data_exoneracao: hit.demissao,
+          p_motivo: `GIAP demissão ${hit.demissao} (competência ${hit.competencia})`
+        });
+        if (errRpc) {
+          item.status = 'error';
+          item.erro = errRpc.message;
+        }
+      }
+
+      if (jobId) {
+        await sb().from('giap_job_items').insert({
+          job_id: jobId,
+          funcionario_id: hr.id,
+          matricula: hr.matricula != null ? String(hr.matricula) : null,
+          nome: hr.nome,
+          acao: 'demissao_encontrada',
+          before_data: { ativo: true },
+          after_data: { demissao: hit.demissao, competencia: hit.competencia },
+          status: item.status,
+          erro: item.erro || null
+        });
+      }
+    } else {
+      relatorio.sem_demissao++;
+    }
+  }
+
+  return relatorio;
+}
+
 export { CODIGO_ORGAO_SEMCAS, getSupabase };
