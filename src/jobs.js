@@ -192,6 +192,7 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao }) {
         let ultimaResposta = null;
         let ultimaBusca = null;
         let ultimaDuracao = 0;
+        let ultimosNomesRetornados = null;
         try {
           for (const busca of variantes) {
             scrapesNome++;
@@ -207,6 +208,9 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao }) {
             inseridos = r.registros_inseridos || 0;
             ultimaResposta = r.raw_amostra;
             ultimaDuracao = r.duracao_ms || 0;
+            if (r.nomes_retornados_amostra) {
+              ultimosNomesRetornados = r.nomes_retornados_amostra;
+            }
             if (bruto > 0) break; // achou algo — para nas variantes seguintes
           }
           extrasNomes += inseridos;
@@ -227,7 +231,8 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao }) {
               bruto,
               pos_filtro: posFiltro,
               duracao_ms: ultimaDuracao,
-              raw_amostra: ultimaResposta
+              raw_amostra: ultimaResposta,
+              nomes_retornados_amostra: ultimosNomesRetornados
             });
           }
         } catch (err) {

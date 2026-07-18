@@ -138,6 +138,10 @@ export function variantesBuscaGiap(nome) {
       fundido.push(t);
     }
   }
+  // Portal parece exigir partículas na string de busca — mantém "DO" e cia.
+  if (fundido.join(' ') !== tokens.join(' ')) {
+    add(fundido.join(' '));
+  }
   const fundidoSemPart = fundido.filter((t) => !particulas.has(t));
   if (fundidoSemPart.length >= 2) {
     add(fundidoSemPart.join(' '));

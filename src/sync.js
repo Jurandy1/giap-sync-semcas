@@ -136,6 +136,7 @@ export async function syncPorNome({
   };
 
   let rawAmostra = null;
+  let nomesRetornadosAmostra = null;
 
   try {
     const { data, requestUrl, raw } = await scrapeRemuneracoes({
@@ -149,6 +150,8 @@ export async function syncPorNome({
     log.parametros.request_url = requestUrl;
     if (data.length === 0) {
       rawAmostra = String(raw || '').slice(0, 200);
+    } else {
+      nomesRetornadosAmostra = data.slice(0, 5).map((r) => r?.funcionario || null);
     }
 
     let filtradas = data;
@@ -184,7 +187,13 @@ export async function syncPorNome({
 
     log.duracao_ms = Date.now() - inicio;
     await logSync(log);
-    return { success: true, resultado: inseridos, raw_amostra: rawAmostra, ...log };
+    return {
+      success: true,
+      resultado: inseridos,
+      raw_amostra: rawAmostra,
+      nomes_retornados_amostra: nomesRetornadosAmostra,
+      ...log
+    };
   } catch (e) {
     log.erro = e.message;
     log.duracao_ms = Date.now() - inicio;
