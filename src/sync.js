@@ -135,8 +135,10 @@ export async function syncPorNome({
     registros_inseridos: 0
   };
 
+  let rawAmostra = null;
+
   try {
-    const { data, requestUrl } = await scrapeRemuneracoes({
+    const { data, requestUrl, raw } = await scrapeRemuneracoes({
       competencia,
       codigoInstituicao,
       nomeServidor,
@@ -145,6 +147,9 @@ export async function syncPorNome({
 
     log.registros_encontrados = data.length;
     log.parametros.request_url = requestUrl;
+    if (data.length === 0) {
+      rawAmostra = String(raw || '').slice(0, 200);
+    }
 
     let filtradas = data;
     if (filtrarNomeAlvo) {
@@ -179,7 +184,7 @@ export async function syncPorNome({
 
     log.duracao_ms = Date.now() - inicio;
     await logSync(log);
-    return { success: true, resultado: inseridos, ...log };
+    return { success: true, resultado: inseridos, raw_amostra: rawAmostra, ...log };
   } catch (e) {
     log.erro = e.message;
     log.duracao_ms = Date.now() - inicio;

@@ -180,21 +180,35 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao }) {
       } catch (err) {
         console.warn('[jobs] listar buscas nome', err.message);
       }
+      const debugNomes = [];
       for (let i = 0; i < buscasNome.length; i++) {
         const item = buscasNome[i];
-        // 1 tentativa: nome completo (como no Portal Dados Abertos)
-        const busca = (item.variantes && item.variantes[0]) || item.busca;
+        const variantes = (item.variantes && item.variantes.length)
+          ? item.variantes
+          : [item.busca];
+        let bruto = 0;
+        let posFiltro = 0;
+        let inseridos = 0;
+        let ultimaResposta = null;
+        let ultimaBusca = null;
+        let ultimaDuracao = 0;
         try {
-          scrapesNome++;
-          const r = await syncPorNome({
-            nomeServidor: busca,
-            codigoInstituicao: 1,
-            competencia,
-            filtrarNomeAlvo: item.nome
-          });
-          const bruto = r.registros_encontrados || 0;
-          const posFiltro = r.registros_filtrados || 0;
-          const inseridos = r.registros_inseridos || 0;
+          for (const busca of variantes) {
+            scrapesNome++;
+            ultimaBusca = busca;
+            const r = await syncPorNome({
+              nomeServidor: busca,
+              codigoInstituicao: 1,
+              competencia,
+              filtrarNomeAlvo: item.nome
+            });
+            bruto = r.registros_encontrados || 0;
+            posFiltro = r.registros_filtrados || 0;
+            inseridos = r.registros_inseridos || 0;
+            ultimaResposta = r.raw_amostra;
+            ultimaDuracao = r.duracao_ms || 0;
+            if (bruto > 0) break; // achou algo — para nas variantes seguintes
+          }
           extrasNomes += inseridos;
           if (inseridos > 0) {
             nomesEncontrados++;
@@ -205,10 +219,29 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao }) {
             else if (posFiltro === 0) nomesRejeitadosFiltro++;
             else nomesSemMatricula++;
           }
+          if (inseridos === 0 && debugNomes.length < 3) {
+            debugNomes.push({
+              nome_rh: item.nome,
+              variantes_tentadas: variantes,
+              ultima_busca: ultimaBusca,
+              bruto,
+              pos_filtro: posFiltro,
+              duracao_ms: ultimaDuracao,
+              raw_amostra: ultimaResposta
+            });
+          }
         } catch (err) {
           nomesVazios++;
           nomesScrapeVazio++;
-          console.warn('[jobs] sync nome', busca, err.message);
+          console.warn('[jobs] sync nome', ultimaBusca || item.busca, err.message);
+          if (debugNomes.length < 3) {
+            debugNomes.push({
+              nome_rh: item.nome,
+              variantes_tentadas: variantes,
+              ultima_busca: ultimaBusca,
+              erro: err.message
+            });
+          }
         }
 
         if (i % 3 === 0 || i === buscasNome.length - 1) {
@@ -248,6 +281,7 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao }) {
         nomes_sem_matricula: nomesSemMatricula,
         nomes_encontrados_reais: nomesEncontradosReais,
         scrapes_nome: scrapesNome,
+        debug_nomes: debugNomes,
         success: syncRes.success
       };
       await updateJob(jobId, { progresso_pct: 30, resumo: { ...resumo, etapa: 'sync_ok' } });
