@@ -145,6 +145,7 @@ const TIPOS_ENRIQUECER = new Set([
   'matricula',
   'nome_exato',
   'nome_admissao',
+  'busca_nome',
   'nome_similar_admissao',
   'nome_similar'
 ]);
@@ -341,7 +342,8 @@ export async function enriquecerFuncionarios({
   competencia,
   dryRun = false,
   onProgress = null,
-  jobId = null
+  jobId = null,
+  matchesBusca = null
 } = {}) {
   // Competência inteira: buscas por nome sem órgão entram na folha e precisam casar
   const folha = await carregarFolhaCompetencia(competencia);
@@ -356,6 +358,7 @@ export async function enriquecerFuncionarios({
     total_elegiveis: elegiveis.length,
     total_folha: folha.length,
     matched: 0,
+    via_busca_nome: 0,
     ambiguo: 0,
     sem_match: 0,
     skip_admissao: 0,
@@ -370,7 +373,18 @@ export async function enriquecerFuncionarios({
   let processados = 0;
 
   for (const hr of elegiveis) {
-    const { match, tipo } = encontrarMatch(hr, idx);
+    // A busca por nome desta execução já validou a pessoa (filtro de
+    // similaridade contra o nome do RH) — usa o link direto pela matrícula
+    let resultado = null;
+    const matBusca = matchesBusca?.get(hr.id);
+    if (matBusca) {
+      const viaBusca = idx.porMatricula.get(String(matBusca).trim());
+      if (viaBusca) {
+        resultado = { match: viaBusca, tipo: 'busca_nome', confianca: 0.9 };
+        relatorio.via_busca_nome++;
+      }
+    }
+    const { match, tipo } = resultado || encontrarMatch(hr, idx);
     processados++;
     if (onProgress) {
       await onProgress({

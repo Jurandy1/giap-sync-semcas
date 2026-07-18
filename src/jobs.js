@@ -133,6 +133,9 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao }) {
   const resumo = {};
   // Quem foi pesquisado por nome nesta execução — gate da fila de ausência
   let verificadosNome = null;
+  // funcionario_id → matrícula única achada pela busca por nome (a busca já
+  // validou a pessoa com filtro de similaridade; o enriquecer aproveita o link)
+  let matriculasBusca = null;
   try {
     const setProgress = async (base, localPct, label) => {
       const pct = Math.min(99, Math.round(base + localPct * 0.3));
@@ -230,6 +233,7 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao }) {
       let buscasNome = [];
       let buscasPendentes = 0;
       verificadosNome = new Set();
+      matriculasBusca = new Map();
       try {
         const todas = await listarBuscasNomePendentes(competencia);
         // Sem matrícula primeiro (preencher matrícula); dentro do grupo,
@@ -256,6 +260,7 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao }) {
         let bruto = 0;
         let posFiltro = 0;
         let inseridos = 0;
+        let linhasInseridas = [];
         let ultimaResposta = null;
         let ultimaBusca = null;
         let ultimaDuracao = 0;
@@ -277,15 +282,27 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao }) {
             bruto = r.registros_encontrados || 0;
             posFiltro = r.registros_filtrados || 0;
             inseridos = r.registros_inseridos || 0;
+            if (inseridos > 0) linhasInseridas = r.resultado || [];
             ultimaResposta = r.raw_amostra;
             ultimaDuracao = r.duracao_ms || 0;
             if (r.nomes_retornados_amostra) {
               ultimosNomesRetornados = r.nomes_retornados_amostra;
             }
-            if (bruto > 0) break; // achou algo — para nas variantes seguintes
+            // Só para quando a PESSOA foi achada (pós-filtro) — homônimo
+            // bruto não conta; senão "MARIA LIMA" impedia de tentar "AMPARO"
+            if (posFiltro > 0) break;
           }
           // Todas as variantes rodaram sem erro — ausência verificável
           verificadosNome.add(item.funcionario_id);
+          // Matrícula única achada p/ quem estava sem — o enriquecer usa o link
+          if (inseridos > 0 && !item.tem_matricula) {
+            const mats = [
+              ...new Set(
+                linhasInseridas.map((x) => String(x.matricula ?? '').trim()).filter(Boolean)
+              )
+            ];
+            if (mats.length === 1) matriculasBusca.set(item.funcionario_id, mats[0]);
+          }
           extrasNomes += inseridos;
           if (inseridos > 0) {
             nomesEncontrados++;
@@ -391,6 +408,7 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao }) {
         competencia,
         dryRun,
         jobId,
+        matchesBusca: matriculasBusca,
         onProgress: async ({ processados, total, pct }) => {
           if (pct - lastEnrichPct < 2 && processados < total) return;
           lastEnrichPct = pct;
@@ -406,6 +424,7 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao }) {
         total_hr: enrich.total_hr,
         total_elegiveis: enrich.total_elegiveis,
         matched: enrich.matched,
+        via_busca_nome: enrich.via_busca_nome,
         matricula_preenchida: enrich.matricula_preenchida,
         nome_corrigido: enrich.nome_corrigido,
         admissao_preenchida: enrich.admissao_preenchida,
