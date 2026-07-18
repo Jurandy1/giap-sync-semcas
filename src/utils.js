@@ -56,25 +56,62 @@ export function similaridadeNome(a, b) {
   return cobertura * 0.85 + tamanho * 0.15;
 }
 
+const PARTICULAS_NOME = new Set(['DA', 'DE', 'DO', 'DAS', 'DOS', 'E', 'DI', 'DU']);
+
 /**
- * Nome "forte" para busca no GIAP: usa o nome completo.
- * Se tiver mais de 4 tokens, manda os 4 primeiros (limite prático do portal).
+ * Nome "forte" para busca no GIAP (1ª tentativa).
+ * O portal usa LIKE prefixo — nome completo demais costuma zerar o resultado.
  */
 export function nomeBuscaGiap(nome) {
-  const tokens = tokensNome(nome);
-  if (!tokens.length) return null;
-  if (tokens.length <= 4) return tokens.join(' ');
-  return tokens.slice(0, 4).join(' ');
+  const variantes = variantesBuscaGiap(nome);
+  return variantes[0] || null;
 }
 
 /**
- * Converte data no formato DD-MM-YYYY (GIAP) pra ISO YYYY-MM-DD (Postgres).
+ * Variantes de prefixo para o GIAP (LIKE 'texto%').
+ * Ordem: mais específico → mais curto. Exemplos do portal usam 1 token
+ * ("SANTANA", "JURANDY"); nome completo com 4 tokens quase sempre volta vazio.
+ */
+export function variantesBuscaGiap(nome) {
+  const tokens = tokensNome(nome);
+  if (!tokens.length) return [];
+
+  const out = [];
+  const add = (s) => {
+    const v = String(s || '').trim();
+    if (v && !out.includes(v)) out.push(v);
+  };
+
+  const semPart = tokens.filter((t) => !PARTICULAS_NOME.has(t));
+  const primeiro = tokens[0];
+  const sobrenomes = semPart.slice(1);
+
+  // 1) primeiro + último sobrenome (melhor custo/benefício no LIKE prefix)
+  if (sobrenomes.length) add(`${primeiro} ${sobrenomes[sobrenomes.length - 1]}`);
+
+  // 2) primeiros 2 tokens (ex.: MARIA JOSE)
+  if (tokens.length >= 2) add(tokens.slice(0, 2).join(' '));
+
+  // 3) primeiros 3 (quando o 2 ainda for genérico)
+  if (tokens.length >= 3) add(tokens.slice(0, 3).join(' '));
+
+  // Não usa só o 1º nome aqui: estoura o limite de 100 do portal e gasta RAM.
+
+  return out;
+}
+
+/**
+ * Converte data do GIAP (DD-MM-YYYY, DD/MM/YYYY ou ISO) pra YYYY-MM-DD.
  */
 export function parseDataBR(str) {
   if (!str) return null;
-  const m = String(str).match(/^(\d{2})-(\d{2})-(\d{4})$/);
-  if (!m) return null;
-  return `${m[3]}-${m[2]}-${m[1]}`;
+  const s = String(str).trim();
+  let m = s.match(/^(\d{2})-(\d{2})-(\d{4})$/);
+  if (m) return `${m[3]}-${m[2]}-${m[1]}`;
+  m = s.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
+  if (m) return `${m[3]}-${m[2]}-${m[1]}`;
+  if (/^\d{4}-\d{2}-\d{2}/.test(s)) return s.slice(0, 10);
+  return null;
 }
 
 /**

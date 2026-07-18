@@ -9,17 +9,29 @@
  *
  * Enriquecimento: preenche matrícula/admissão/nome quando o match é confiável.
  */
-import { normalizarNome, similaridadeNome, nomeBuscaGiap } from './utils.js';
+import {
+  normalizarNome,
+  similaridadeNome,
+  nomeBuscaGiap,
+  variantesBuscaGiap
+} from './utils.js';
 import { getSupabase } from './supabase.js';
 
 const CODIGO_ORGAO_SEMCAS = process.env.GIAP_CODIGO_ORGAO || '9';
 const LOTACAO_SEMCAS = 'SEMCAS';
 
+function ehFolhaSemcas(f) {
+  return (
+    String(f?.lotacao || '').toUpperCase().trim() === LOTACAO_SEMCAS ||
+    String(f?.codigo_orgao ?? '') === String(CODIGO_ORGAO_SEMCAS)
+  );
+}
+
 function sb() {
   return getSupabase();
 }
 
-export { nomeBuscaGiap };
+export { nomeBuscaGiap, variantesBuscaGiap };
 
 function cargoEhServicoPrestado(cargo) {
   if (!cargo) return false;
@@ -46,16 +58,16 @@ function normalizarDataISO(d) {
 
 /**
  * Confere admissão RH × GIAP.
- * - Se o RH tem data: GIAP precisa ter a mesma (obrigatório).
- * - Se o RH não tem: 'sem_rh' — ainda permite preencher matrícula/admissão em match por nome.
+ * - Datas diferentes → 'divergente' (bloqueia).
+ * - GIAP sem data → 'sem_giap' (ainda permite preencher matrícula).
+ * - RH sem data → 'sem_rh' (permite preencher matrícula/admissão).
  */
 function statusAdmissao(hrAdmissao, folhaAdmissao) {
   const a = normalizarDataISO(hrAdmissao);
   const b = normalizarDataISO(folhaAdmissao);
-  if (a) {
-    if (!b) return 'divergente';
-    return a === b ? 'ok' : 'divergente';
-  }
+  if (a && b) return a === b ? 'ok' : 'divergente';
+  if (a && !b) return 'sem_giap';
+  if (!a && b) return 'sem_rh';
   return 'sem_rh';
 }
 
@@ -76,6 +88,23 @@ async function carregarFolhaSemcas(competencia) {
     .or(`lotacao.eq.${LOTACAO_SEMCAS},codigo_orgao.eq.${CODIGO_ORGAO_SEMCAS}`);
   if (error) throw error;
   return data || [];
+}
+
+/** Folha inteira da competência (inclui buscas por nome sem filtro de órgão). */
+async function carregarFolhaCompetencia(competencia) {
+  const { data, error } = await sb()
+    .from('folha_pmsl')
+    .select('*')
+    .eq('competencia', competencia);
+  if (error) throw error;
+  return data || [];
+}
+
+/** Prefere registro SEMCAS quando há homônimos. */
+function preferirSemcas(lista) {
+  if (!lista?.length) return lista || [];
+  const semcas = lista.filter(ehFolhaSemcas);
+  return semcas.length ? semcas : lista;
 }
 
 async function carregarFuncionariosAtivos() {
@@ -154,8 +183,8 @@ function encontrarMatch(hr, idx) {
   const nomeNorm = normalizarNome(hr.nome);
   if (!nomeNorm) return { match: null, tipo: 'sem_match', confianca: 0 };
 
-  // 2) Nome completo exatamente igual
-  const exatos = idx.porNome.get(nomeNorm) || [];
+  // 2) Nome completo exatamente igual (prioriza SEMCAS se houver homônimo)
+  const exatos = preferirSemcas(idx.porNome.get(nomeNorm) || []);
   if (exatos.length === 1) {
     return { match: exatos[0], tipo: 'nome_exato', confianca: 0.95 };
   }
@@ -163,7 +192,9 @@ function encontrarMatch(hr, idx) {
     // 3) Desambigua com data de admissão
     const admHr = normalizarDataISO(hr.data_admissao);
     if (admHr) {
-      const comAdm = exatos.filter((f) => normalizarDataISO(f.admissao) === admHr);
+      const comAdm = preferirSemcas(
+        exatos.filter((f) => normalizarDataISO(f.admissao) === admHr)
+      );
       if (comAdm.length === 1) {
         return { match: comAdm[0], tipo: 'nome_admissao', confianca: 0.98 };
       }
@@ -204,9 +235,17 @@ function encontrarMatch(hr, idx) {
     };
   }
   if (candidatos.length > 1) {
-    // Empate: pega o de maior similaridade se for único no topo
-    candidatos.sort((a, b) => b.sim - a.sim);
-    if (candidatos[0].sim - candidatos[1].sim >= 0.03) {
+    // Empate: SEMCAS primeiro, depois maior similaridade
+    candidatos.sort((a, b) => {
+      const sa = ehFolhaSemcas(a.f) ? 1 : 0;
+      const sb = ehFolhaSemcas(b.f) ? 1 : 0;
+      if (sb !== sa) return sb - sa;
+      return b.sim - a.sim;
+    });
+    if (
+      candidatos[0].sim - candidatos[1].sim >= 0.03 ||
+      (ehFolhaSemcas(candidatos[0].f) && !ehFolhaSemcas(candidatos[1].f))
+    ) {
       const c = candidatos[0];
       return {
         match: c.f,
@@ -233,7 +272,8 @@ export async function enriquecerFuncionarios({
   onProgress = null,
   jobId = null
 } = {}) {
-  const folha = await carregarFolhaSemcas(competencia);
+  // Competência inteira: buscas por nome sem órgão entram na folha e precisam casar
+  const folha = await carregarFolhaCompetencia(competencia);
   const idx = indexarFolha(folha);
   const { funcionarios, lotByFunc, vincById, vinculoSpId } = await carregarFuncionariosAtivos();
 
@@ -421,11 +461,11 @@ export async function enriquecerFuncionarios({
 }
 
 /**
- * Nomes completos (busca GIAP) de ativos sem matrícula que ainda não estão na folha.
- * Evita reconsultar quem já foi puxado por órgão/letra.
+ * Ativos sem matrícula ainda ausentes da folha (por nome exato).
+ * Cada item traz variantes de prefixo — o GIAP é LIKE 'texto%', não match exato.
  */
 export async function listarBuscasNomeSemMatricula(competencia) {
-  const folha = await carregarFolhaSemcas(competencia);
+  const folha = await carregarFolhaCompetencia(competencia);
   const nomesFolha = new Set(
     folha.map((f) => normalizarNome(f.funcionario)).filter(Boolean)
   );
@@ -437,7 +477,7 @@ export async function listarBuscasNomeSemMatricula(competencia) {
   if (error) throw error;
 
   const buscas = [];
-  const vistos = new Set();
+  const vistosChave = new Set();
   for (const hr of funcs || []) {
     if (!matriculaVazia(hr.matricula)) continue;
 
@@ -445,13 +485,18 @@ export async function listarBuscasNomeSemMatricula(competencia) {
     if (!nn || nomesFolha.has(nn)) continue;
     if (tokensLen(hr.nome) < 2) continue;
 
-    const busca = nomeBuscaGiap(hr.nome);
-    if (!busca || vistos.has(busca)) continue;
-    vistos.add(busca);
+    const variantes = variantesBuscaGiap(hr.nome);
+    if (!variantes.length) continue;
+
+    // Dedup por nome normalizado (não pela 1ª variante)
+    if (vistosChave.has(nn)) continue;
+    vistosChave.add(nn);
+
     buscas.push({
       funcionario_id: hr.id,
       nome: hr.nome,
-      busca,
+      busca: variantes[0],
+      variantes,
       data_admissao: hr.data_admissao
     });
   }
