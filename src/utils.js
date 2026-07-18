@@ -96,6 +96,11 @@ const PARTICULAS_NOME = new Set(['DA', 'DE', 'DO', 'DAS', 'DOS', 'E', 'DI', 'DU'
 export function fundirTokensCurtos(tokens) {
   const out = [];
   for (const t of tokens) {
+    // Conceição partido no cadastro: "CONCEI" + "CAO"
+    if (out.length > 0 && out[out.length - 1] === 'CONCEI' && t === 'CAO') {
+      out[out.length - 1] = 'CONCEICAO';
+      continue;
+    }
     if (t.length <= 3 && !PARTICULAS_NOME.has(t) && out.length > 0) {
       out[out.length - 1] += t;
     } else {
