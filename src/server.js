@@ -136,11 +136,17 @@ app.post('/sync/nome', async (req, res) => {
     const {
       nomeServidor,
       codigoInstituicao = 1,
-      competencia = competenciaAtual()
+      competencia = competenciaAtual(),
+      filtrarNomeAlvo = null
     } = req.body;
     if (!nomeServidor) return res.status(400).json({ error: 'nomeServidor required' });
     if (!validarCompetencia(competencia)) return res.status(400).json({ error: 'competencia inválida' });
-    const resultado = await syncPorNome({ nomeServidor, codigoInstituicao, competencia });
+    const resultado = await syncPorNome({
+      nomeServidor,
+      codigoInstituicao,
+      competencia,
+      filtrarNomeAlvo: filtrarNomeAlvo || nomeServidor
+    });
     res.json(resultado);
   } catch (e) {
     console.error('[/sync/nome]', e);

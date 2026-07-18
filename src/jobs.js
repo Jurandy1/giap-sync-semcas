@@ -279,19 +279,20 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao, filt
           const semMat = !b.tem_matricula;
           const semAdm =
             b.data_admissao == null || String(b.data_admissao).trim() === '';
-          if (comMat) {
-            if (semMat) return true;
-            return soSemAdm ? semAdm : true;
-          }
-          if (soSemMat && soSemAdm) return semMat || semAdm;
-          if (soSemMat) return semMat;
-          if (soSemAdm) return semAdm;
-          return semMat;
+          // Quem já tem matrícula mas NÃO está na folha deve entrar
+          // (caso Jurandy / maioria com matrícula no RH).
+          if (soSemAdm && !semAdm && !semMat && !comMat) return false;
+          if (soSemAdm && !semAdm && semMat) return true;
+          if (soSemAdm && !semAdm) return false;
+          if (!comMat && !semMat) return false; // só se desmarcar "incluir com matrícula"
+          return true;
         });
-        // Sem matrícula primeiro; nomes mais longos primeiro
+        // Prioriza sem matrícula se marcado; depois nomes mais longos
         todas.sort((a, b) => {
-          const grupo = Number(a.tem_matricula) - Number(b.tem_matricula);
-          if (grupo !== 0) return grupo;
+          if (soSemMat) {
+            const grupo = Number(a.tem_matricula) - Number(b.tem_matricula);
+            if (grupo !== 0) return grupo;
+          }
           return (
             (b.variantes?.[0] || b.busca || '').split(' ').length -
             (a.variantes?.[0] || a.busca || '').split(' ').length
