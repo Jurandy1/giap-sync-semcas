@@ -7,13 +7,17 @@ import {
   aplicarExoneracoes,
   CODIGO_ORGAO_SEMCAS,
   getSupabase,
-  listarBuscasNomeSemMatricula
+  listarBuscasNomePendentes
 } from './rhsemcas.js';
 import { competenciaAtual } from './utils.js';
 import { closeBrowser } from './scraper.js';
 
-/** Limite de buscas por nome (Render free). Página reutilizada ≈ 1 scrape leve. */
-const MAX_BUSCAS_NOME = Math.max(0, Number(process.env.GIAP_MAX_BUSCAS_NOME || 20));
+/** Limite de buscas por nome por execução (Railway free). Página reutilizada ≈ 1 scrape leve. */
+const MAX_BUSCAS_NOME = Math.max(0, Number(process.env.GIAP_MAX_BUSCAS_NOME || 40));
+
+/** Varredura A–Z desligada por padrão — busca por nome completo é mais precisa.
+ *  Reative com GIAP_SYNC_LETRAS=1 se precisar engordar a folha em massa. */
+const SYNC_LETRAS_ATIVO = process.env.GIAP_SYNC_LETRAS === '1';
 
 /** Se já tem muitos registros SEMCAS na folha, pula A–Z (só busca nomes faltantes). */
 const FOLHA_MIN_SKIP_LETRAS = Math.max(
@@ -21,10 +25,52 @@ const FOLHA_MIN_SKIP_LETRAS = Math.max(
   Number(process.env.GIAP_FOLHA_MIN_SKIP_LETRAS || 400)
 );
 
+/** Watchdog por scrape — acima disso considera pendurado e reseta o Chrome. */
+const SCRAPE_WATCHDOG_MS = Math.max(
+  60000,
+  Number(process.env.GIAP_SCRAPE_WATCHDOG_MS || 180000)
+);
+
 const running = new Map(); // jobId -> promise
 
 function sb() {
   return getSupabase();
+}
+
+/** Rejeita se a promise não resolver a tempo (o scrape continua rodando — chame closeBrowser depois). */
+function comTimeout(promise, ms, label) {
+  let timer;
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      timer = setTimeout(
+        () => reject(new Error(`watchdog: ${label} não respondeu em ${Math.round(ms / 1000)}s`)),
+        ms
+      );
+    })
+  ]).finally(() => clearTimeout(timer));
+}
+
+/**
+ * Marca como erro jobs presos em pending/running (processo morreu no meio —
+ * OOM/restart do Railway deixa o job órfão). Chamado no boot e antes de novo job.
+ */
+export async function limparJobsOrfaos(motivo = 'Interrompido: o serviço reiniciou (OOM/deploy) com o job em andamento.') {
+  const { data, error } = await sb()
+    .from('giap_jobs')
+    .update({
+      status: 'error',
+      erro: motivo,
+      finished_at: new Date().toISOString()
+    })
+    .in('status', ['pending', 'running'])
+    .select('id');
+  if (error) {
+    console.error('[jobs] limpar órfãos:', error.message);
+    return 0;
+  }
+  if (data?.length) console.log('[jobs] jobs órfãos marcados como erro:', data.map((j) => j.id).join(', '));
+  return data?.length || 0;
 }
 
 async function updateJob(id, patch) {
@@ -46,14 +92,7 @@ export async function criarEExecutarJob({
   const comp = Number(competencia || competenciaAtual());
 
   // Jobs órfãos (Render OOM/restart) ficam "running" — cancela ao iniciar outro
-  await sb()
-    .from('giap_jobs')
-    .update({
-      status: 'error',
-      erro: 'Interrompido ou substituído por novo job (serviço reiniciou/OOM).',
-      finished_at: new Date().toISOString()
-    })
-    .in('status', ['pending', 'running']);
+  await limparJobsOrfaos('Interrompido ou substituído por novo job (serviço reiniciou/OOM).');
 
   const { data: job, error } = await sb()
     .from('giap_jobs')
@@ -92,6 +131,8 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao }) {
   });
 
   const resumo = {};
+  // Quem foi pesquisado por nome nesta execução — gate da fila de ausência
+  let verificadosNome = null;
   try {
     const setProgress = async (base, localPct, label) => {
       const pct = Math.min(99, Math.round(base + localPct * 0.3));
@@ -104,10 +145,17 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao }) {
     // 1) Sync órgão (sempre no ciclo completo / sync_orgao)
     if (tipo === 'ciclo_completo' || tipo === 'sync_orgao') {
       await setProgress(0, 0, 'sync_orgao');
-      const syncRes = await syncPorOrgao({
-        codigoOrgao: String(codigoOrgao),
-        codigoInstituicao: 1,
-        competencia
+      const syncRes = await comTimeout(
+        syncPorOrgao({
+          codigoOrgao: String(codigoOrgao),
+          codigoInstituicao: 1,
+          competencia
+        }),
+        SCRAPE_WATCHDOG_MS,
+        'sync_orgao'
+      ).catch(async (err) => {
+        await closeBrowser().catch(() => {});
+        throw err;
       });
       // GIAP limita a ~100 — completa com A–Z só se a folha ainda estiver magra
       let extras = 0;
@@ -125,7 +173,13 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao }) {
         /* ignore */
       }
 
-      if (folhaAntes >= FOLHA_MIN_SKIP_LETRAS) {
+      if (!SYNC_LETRAS_ATIVO) {
+        pulouLetras = true;
+        await updateJob(jobId, {
+          progresso_pct: 20,
+          resumo: { ...resumo, etapa: 'skip_letras_desativado' }
+        });
+      } else if (folhaAntes >= FOLHA_MIN_SKIP_LETRAS) {
         pulouLetras = true;
         await updateJob(jobId, {
           progresso_pct: 20,
@@ -138,16 +192,23 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao }) {
         const letras = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split('');
         for (let i = 0; i < letras.length; i++) {
           try {
-            const r = await syncPorNome({
-              nomeServidor: letras[i],
-              codigoInstituicao: 1,
-              competencia,
-              filtrarOrgao: String(codigoOrgao)
-            });
+            const r = await comTimeout(
+              syncPorNome({
+                nomeServidor: letras[i],
+                codigoInstituicao: 1,
+                competencia,
+                filtrarOrgao: String(codigoOrgao)
+              }),
+              SCRAPE_WATCHDOG_MS,
+              `sync_letra_${letras[i]}`
+            );
             extras += r.registros_inseridos || 0;
             letrasFeitas++;
           } catch (err) {
             console.warn('[jobs] sync letra', letras[i], err.message);
+            if (String(err.message).startsWith('watchdog:')) {
+              await closeBrowser().catch(() => {});
+            }
           }
           await updateJob(jobId, {
             progresso_pct: Math.round(5 + ((i + 1) / letras.length) * 12),
@@ -168,13 +229,19 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao }) {
       let scrapesNome = 0;
       let buscasNome = [];
       let buscasPendentes = 0;
+      verificadosNome = new Set();
       try {
-        const todas = await listarBuscasNomeSemMatricula(competencia);
-        todas.sort(
-          (a, b) =>
+        const todas = await listarBuscasNomePendentes(competencia);
+        // Sem matrícula primeiro (preencher matrícula); dentro do grupo,
+        // nomes mais longos primeiro (prefixo mais específico no GIAP)
+        todas.sort((a, b) => {
+          const grupo = Number(a.tem_matricula) - Number(b.tem_matricula);
+          if (grupo !== 0) return grupo;
+          return (
             (b.variantes?.[0] || b.busca || '').split(' ').length -
             (a.variantes?.[0] || a.busca || '').split(' ').length
-        );
+          );
+        });
         buscasPendentes = Math.max(0, todas.length - MAX_BUSCAS_NOME);
         buscasNome = todas.slice(0, MAX_BUSCAS_NOME);
       } catch (err) {
@@ -197,12 +264,16 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao }) {
           for (const busca of variantes) {
             scrapesNome++;
             ultimaBusca = busca;
-            const r = await syncPorNome({
-              nomeServidor: busca,
-              codigoInstituicao: 1,
-              competencia,
-              filtrarNomeAlvo: item.nome
-            });
+            const r = await comTimeout(
+              syncPorNome({
+                nomeServidor: busca,
+                codigoInstituicao: 1,
+                competencia,
+                filtrarNomeAlvo: item.nome
+              }),
+              SCRAPE_WATCHDOG_MS,
+              `sync_nome_${busca}`
+            );
             bruto = r.registros_encontrados || 0;
             posFiltro = r.registros_filtrados || 0;
             inseridos = r.registros_inseridos || 0;
@@ -213,6 +284,8 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao }) {
             }
             if (bruto > 0) break; // achou algo — para nas variantes seguintes
           }
+          // Todas as variantes rodaram sem erro — ausência verificável
+          verificadosNome.add(item.funcionario_id);
           extrasNomes += inseridos;
           if (inseridos > 0) {
             nomesEncontrados++;
@@ -239,6 +312,9 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao }) {
           nomesVazios++;
           nomesScrapeVazio++;
           console.warn('[jobs] sync nome', ultimaBusca || item.busca, err.message);
+          if (String(err.message).startsWith('watchdog:')) {
+            await closeBrowser().catch(() => {});
+          }
           if (debugNomes.length < 3) {
             debugNomes.push({
               nome_rh: item.nome,
@@ -279,6 +355,9 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao }) {
         extras_nomes: extrasNomes,
         buscas_nome: buscasNome.length,
         buscas_nome_pendentes: buscasPendentes,
+        buscas_sem_matricula: buscasNome.filter((b) => !b.tem_matricula).length,
+        buscas_com_matricula: buscasNome.filter((b) => b.tem_matricula).length,
+        nomes_verificados: verificadosNome.size,
         nomes_encontrados: nomesEncontrados,
         nomes_vazios: nomesVazios,
         nomes_scrape_vazio: nomesScrapeVazio,
@@ -355,6 +434,9 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao }) {
         competencia,
         dryRun,
         jobId,
+        // No ciclo completo, ausência só vale p/ quem foi pesquisado por nome;
+        // no job avulso de exonerações (sem fase de busca) mantém comportamento antigo
+        verificadosIds: verificadosNome ? [...verificadosNome] : null,
         onProgress: async ({ processados, total, pct }) => {
           await updateJob(jobId, {
             processados,
@@ -366,7 +448,10 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao }) {
       });
       resumo.exoneracoes = {
         exonerados: exo.exonerados,
-        revisao_ausencia: exo.revisao_ausencia
+        revisao_ausencia: exo.revisao_ausencia,
+        ausencia_nao_verificada: exo.ausencia_nao_verificada,
+        ausencia_pausada_folha_magra: exo.ausencia_pausada_folha_magra,
+        folha_registros: exo.folha_registros
       };
     }
 

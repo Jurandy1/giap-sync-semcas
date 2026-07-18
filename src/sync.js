@@ -39,13 +39,43 @@ function transformar(item) {
   };
 }
 
+/** Colunas reais de giap_sync_log — campos extras (ex.: registros_filtrados) vão pra parametros. */
+const LOG_COLUNAS = [
+  'tipo',
+  'parametros',
+  'registros_encontrados',
+  'registros_inseridos',
+  'registros_atualizados',
+  'erro',
+  'duracao_ms'
+];
+
 async function logSync(payload) {
   try {
-    const { error } = await sb().from('giap_sync_log').insert(payload);
+    const row = {};
+    const extras = {};
+    for (const [k, v] of Object.entries(payload)) {
+      if (v === undefined) continue;
+      if (LOG_COLUNAS.includes(k)) row[k] = v;
+      else extras[k] = v;
+    }
+    if (Object.keys(extras).length) {
+      row.parametros = { ...(row.parametros || {}), ...extras };
+    }
+    const { error } = await sb().from('giap_sync_log').insert(row);
     if (error) console.error('[sync] falhou ao logar:', error.message);
   } catch (err) {
     console.error('[sync] falhou ao logar:', err.message);
   }
+}
+
+/** Remove duplicatas da chave (competencia, matricula, codigo_instituicao) — evita "ON CONFLICT DO UPDATE cannot affect row a second time". */
+function dedupePorChave(registros) {
+  const m = new Map();
+  for (const r of registros) {
+    m.set(`${r.competencia}|${r.matricula}|${r.codigo_instituicao}`, r);
+  }
+  return [...m.values()];
 }
 
 /**
@@ -78,9 +108,9 @@ export async function syncPorOrgao({ codigoOrgao, codigoInstituicao = 1, compete
     log.registros_filtrados = filtradas.length;
 
     if (filtradas.length > 0) {
-      const registros = filtradas
-        .map(transformar)
-        .filter((r) => r.matricula);
+      const registros = dedupePorChave(
+        filtradas.map(transformar).filter((r) => r.matricula)
+      );
 
       if (registros.length > 0) {
         const { error, data: inseridos } = await sb()
@@ -171,7 +201,9 @@ export async function syncPorNome({
 
     let inseridos = [];
     if (filtradas.length > 0) {
-      const registros = filtradas.map(transformar).filter((r) => r.matricula);
+      const registros = dedupePorChave(
+        filtradas.map(transformar).filter((r) => r.matricula)
+      );
       if (registros.length > 0) {
         const { error, data: ins } = await sb()
           .from('folha_pmsl')

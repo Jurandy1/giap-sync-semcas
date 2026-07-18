@@ -9,7 +9,7 @@ import {
 import { scrapeRemuneracoes, scrapeOrgaos, closeBrowser } from './scraper.js';
 import { competenciaAtual, validarCompetencia } from './utils.js';
 import { enriquecerFuncionarios, aplicarExoneracoes, CODIGO_ORGAO_SEMCAS } from './rhsemcas.js';
-import { criarEExecutarJob, obterJob, tentarCronMensal } from './jobs.js';
+import { criarEExecutarJob, obterJob, tentarCronMensal, limparJobsOrfaos } from './jobs.js';
 
 const app = express();
 app.use(express.json({ limit: '2mb' }));
@@ -288,6 +288,8 @@ app.post('/cron/mensal', async (req, res) => {
 const PORT = process.env.PORT || 3000;
 const server = app.listen(PORT, () => {
   console.log(`giap-sync-semcas listening on :${PORT}`);
+  // Jobs presos em running de antes do restart (OOM/deploy) viram error
+  limparJobsOrfaos().catch((e) => console.error('[boot] limpar órfãos:', e.message));
 });
 
 async function shutdown() {

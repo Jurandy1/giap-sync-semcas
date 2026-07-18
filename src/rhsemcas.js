@@ -515,13 +515,17 @@ export async function enriquecerFuncionarios({
 }
 
 /**
- * Ativos sem matrícula ainda ausentes da folha (por nome exato).
+ * Elegíveis (não terceirizados) ainda ausentes da folha da competência —
+ * com ou sem matrícula. Sem matrícula vem primeiro (prioridade: preencher).
  * Cada item traz variantes de prefixo — o GIAP é LIKE 'texto%', não match exato.
  */
-export async function listarBuscasNomeSemMatricula(competencia) {
+export async function listarBuscasNomePendentes(competencia) {
   const folha = await carregarFolhaCompetencia(competencia);
   const nomesFolha = new Set(
     folha.map((f) => normalizarNome(f.funcionario)).filter(Boolean)
+  );
+  const matriculasFolha = new Set(
+    folha.map((f) => String(f.matricula ?? '').trim()).filter(Boolean)
   );
 
   const idsElegiveis = await carregarIdsElegiveisFolhaPmsl();
@@ -536,7 +540,9 @@ export async function listarBuscasNomeSemMatricula(competencia) {
   const vistosChave = new Set();
   for (const hr of funcs || []) {
     if (!idsElegiveis.has(hr.id)) continue; // terceirizado/sem lotação → fora
-    if (!matriculaVazia(hr.matricula)) continue;
+
+    const temMatricula = !matriculaVazia(hr.matricula);
+    if (temMatricula && matriculasFolha.has(String(hr.matricula).trim())) continue;
 
     const nn = normalizarNome(hr.nome);
     if (!nn || nomesFolha.has(nn)) continue;
@@ -552,12 +558,20 @@ export async function listarBuscasNomeSemMatricula(competencia) {
     buscas.push({
       funcionario_id: hr.id,
       nome: hr.nome,
+      matricula: temMatricula ? String(hr.matricula).trim() : null,
+      tem_matricula: temMatricula,
       busca: variantes[0],
       variantes,
       data_admissao: hr.data_admissao
     });
   }
   return buscas;
+}
+
+/** @deprecated use listarBuscasNomePendentes — mantido p/ scripts antigos. */
+export async function listarBuscasNomeSemMatricula(competencia) {
+  const todas = await listarBuscasNomePendentes(competencia);
+  return todas.filter((b) => !b.tem_matricula);
 }
 
 /**
@@ -568,10 +582,18 @@ export async function aplicarExoneracoes({
   competencia,
   dryRun = false,
   onProgress = null,
-  jobId = null
+  jobId = null,
+  verificadosIds = null
 } = {}) {
   const folha = await carregarFolhaSemcas(competencia);
   const porMatricula = new Map(folha.map((f) => [String(f.matricula), f]));
+  // Ausência só conta para quem foi efetivamente pesquisado por nome nesta
+  // execução (folha do GIAP carrega aos poucos — sem isso, falso positivo).
+  const verificados = verificadosIds ? new Set(verificadosIds) : null;
+  // Com a folha da competência ainda magra no GIAP (carga parcial), nem avalia
+  // ausência — só demissão explícita. Ajuste via GIAP_MIN_FOLHA_AUSENCIA.
+  const minFolhaAusencia = Math.max(0, Number(process.env.GIAP_MIN_FOLHA_AUSENCIA || 300));
+  const ausenciaHabilitada = folha.length >= minFolhaAusencia;
 
   const { data: funcs, error } = await sb()
     .from('funcionarios')
@@ -589,6 +611,9 @@ export async function aplicarExoneracoes({
     total_com_matricula: comMatricula.length,
     exonerados: 0,
     revisao_ausencia: 0,
+    ausencia_nao_verificada: 0,
+    ausencia_pausada_folha_magra: 0,
+    folha_registros: folha.length,
     items: []
   };
 
@@ -668,6 +693,15 @@ export async function aplicarExoneracoes({
 
     // Ausente da folha SEMCAS desta competência, sem demissão → revisão
     if (!naFolha) {
+      if (!ausenciaHabilitada) {
+        relatorio.ausencia_pausada_folha_magra++;
+        continue;
+      }
+      if (verificados && !verificados.has(hr.id)) {
+        // Ainda não pesquisado por nome nesta execução — não dá pra afirmar ausência
+        relatorio.ausencia_nao_verificada++;
+        continue;
+      }
       relatorio.revisao_ausencia++;
       const item = {
         funcionario_id: hr.id,
