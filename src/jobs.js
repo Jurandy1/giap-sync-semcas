@@ -319,6 +319,8 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao }) {
         }
       });
       resumo.enriquecer = {
+        total_hr: enrich.total_hr,
+        total_elegiveis: enrich.total_elegiveis,
         matched: enrich.matched,
         matricula_preenchida: enrich.matricula_preenchida,
         nome_corrigido: enrich.nome_corrigido,

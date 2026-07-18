@@ -20,6 +20,57 @@ import { getSupabase } from './supabase.js';
 const CODIGO_ORGAO_SEMCAS = process.env.GIAP_CODIGO_ORGAO || '9';
 const LOTACAO_SEMCAS = 'SEMCAS';
 
+/** Categorias de vínculo cujos servidores aparecem na folha da Prefeitura no GIAP. */
+function normalizarCategoria(c) {
+  return String(c || '')
+    .normalize('NFD')
+    .replace(/[̀-ͯ]/g, '')
+    .toUpperCase()
+    .replace(/[\/\-_]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+const VINCULOS_FOLHA_PMSL = new Set(
+  [
+    'SERVICO PRESTADO',
+    'EFETIVO',
+    'CONTRATO SEMUS',
+    'CONTRATO TEMPORARIO',
+    'COMISSIONADO'
+  ].map(normalizarCategoria)
+);
+
+/**
+ * IDs de funcionários cujo vínculo ativo cai na folha da Prefeitura no GIAP.
+ * Terceirizados / estagiários / sem lotação ativa ficam de fora — não estão na
+ * folha e apenas poluem "sem_match" / "revisao_ausencia".
+ */
+async function carregarIdsElegiveisFolhaPmsl() {
+  const { data: lots, error: errLot } = await sb()
+    .from('funcionario_lotacao')
+    .select('funcionario_id, vinculo_id, ativo, data_fim')
+    .eq('ativo', true);
+  if (errLot) throw errLot;
+
+  const { data: vinculos, error: errV } = await sb()
+    .from('vinculos')
+    .select('id, categoria');
+  if (errV) throw errV;
+
+  const catById = new Map(
+    (vinculos || []).map((v) => [v.id, normalizarCategoria(v.categoria)])
+  );
+
+  const ids = new Set();
+  for (const l of lots || []) {
+    if (l.data_fim) continue;
+    const cat = catById.get(l.vinculo_id);
+    if (cat && VINCULOS_FOLHA_PMSL.has(cat)) ids.add(l.funcionario_id);
+  }
+  return ids;
+}
+
 function ehFolhaSemcas(f) {
   return (
     String(f?.lotacao || '').toUpperCase().trim() === LOTACAO_SEMCAS ||
@@ -276,10 +327,13 @@ export async function enriquecerFuncionarios({
   const folha = await carregarFolhaCompetencia(competencia);
   const idx = indexarFolha(folha);
   const { funcionarios, lotByFunc, vincById, vinculoSpId } = await carregarFuncionariosAtivos();
+  const idsElegiveis = await carregarIdsElegiveisFolhaPmsl();
+  const elegiveis = funcionarios.filter((f) => idsElegiveis.has(f.id));
 
   const relatorio = {
     competencia,
     total_hr: funcionarios.length,
+    total_elegiveis: elegiveis.length,
     total_folha: folha.length,
     matched: 0,
     ambiguo: 0,
@@ -292,10 +346,10 @@ export async function enriquecerFuncionarios({
     items: []
   };
 
-  const total = funcionarios.length;
+  const total = elegiveis.length;
   let processados = 0;
 
-  for (const hr of funcionarios) {
+  for (const hr of elegiveis) {
     const { match, tipo } = encontrarMatch(hr, idx);
     processados++;
     if (onProgress) {
@@ -470,6 +524,8 @@ export async function listarBuscasNomeSemMatricula(competencia) {
     folha.map((f) => normalizarNome(f.funcionario)).filter(Boolean)
   );
 
+  const idsElegiveis = await carregarIdsElegiveisFolhaPmsl();
+
   const { data: funcs, error } = await sb()
     .from('funcionarios')
     .select('id, nome, matricula, data_admissao')
@@ -479,6 +535,7 @@ export async function listarBuscasNomeSemMatricula(competencia) {
   const buscas = [];
   const vistosChave = new Set();
   for (const hr of funcs || []) {
+    if (!idsElegiveis.has(hr.id)) continue; // terceirizado/sem lotação → fora
     if (!matriculaVazia(hr.matricula)) continue;
 
     const nn = normalizarNome(hr.nome);
@@ -522,7 +579,10 @@ export async function aplicarExoneracoes({
     .eq('ativo', true);
   if (error) throw error;
 
-  const comMatricula = (funcs || []).filter((f) => !matriculaVazia(f.matricula));
+  const idsElegiveis = await carregarIdsElegiveisFolhaPmsl();
+  const comMatricula = (funcs || []).filter(
+    (f) => idsElegiveis.has(f.id) && !matriculaVazia(f.matricula)
+  );
 
   const relatorio = {
     competencia,
