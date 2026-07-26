@@ -63,7 +63,7 @@ No projeto RHSEMCAS, rode `sql/giap_relatorio_api.sql` (cria `giap_jobs`, `giap_
 | GET | `/jobs/:id` | Status / progresso % |
 | POST | `/rhsemcas/enriquecer` | Enriquecimento síncrono (matrícula vazia, nome, admissão vazia, vínculo SP) |
 | POST | `/rhsemcas/exoneracoes` | Exonera se `demissao`; ausência → fila revisão |
-| POST | `/cron/mensal` | Se `giap_config.automatico` e hoje = `dia_mes` (27), dispara ciclo |
+| POST | `/cron/mensal` | Se `giap_config.automatico` e hoje ≥ `dia_mes` (padrão 20), tenta a competência do mês até a folha sair |
 
 ### Edge Function `giap-proxy`
 

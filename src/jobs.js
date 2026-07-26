@@ -604,7 +604,9 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao, filt
 }
 
 /**
- * Cron mensal: se automatico=true e hoje = dia_mes, dispara ciclo.
+ * Cron mensal: se automatico=true, entre dia_mes e o fim do mês tenta a
+ * competência alvo até a folha nova aparecer (ex.: julho → 202607).
+ * Roda 1x por dia; se a competência já tiver registros, não dispara de novo.
  */
 export async function tentarCronMensal() {
   const hoje = new Date();
@@ -615,8 +617,26 @@ export async function tentarCronMensal() {
   if (!cfg?.automatico) {
     return { skipped: true, reason: 'automatico_desligado' };
   }
-  if (dia !== Number(cfg.dia_mes)) {
-    return { skipped: true, reason: 'dia_diferente', dia, dia_mes: cfg.dia_mes };
+
+  const diaInicio = Math.min(31, Math.max(1, Number(cfg.dia_mes) || 20));
+  if (dia < diaInicio) {
+    return { skipped: true, reason: 'antes_da_janela', dia, dia_inicio: diaInicio };
+  }
+
+  const comp = competenciaAtual(hoje);
+
+  // Folha da competência já gravada → não precisa buscar de novo
+  const { count: naFolha } = await sb()
+    .from('folha_pmsl')
+    .select('id', { count: 'exact', head: true })
+    .eq('competencia', comp);
+  if ((naFolha || 0) > 0) {
+    return {
+      skipped: true,
+      reason: 'competencia_ja_na_folha',
+      competencia: comp,
+      count: naFolha
+    };
   }
 
   // Evita duplicar no mesmo dia
@@ -626,23 +646,24 @@ export async function tentarCronMensal() {
     .from('giap_jobs')
     .select('id, status')
     .eq('modo', 'automatico')
+    .eq('competencia', comp)
     .gte('created_at', inicioDia.toISOString())
     .in('status', ['pending', 'running', 'done'])
     .limit(1);
 
   if (existentes?.length) {
-    return { skipped: true, reason: 'ja_rodou_hoje', job_id: existentes[0].id };
+    return { skipped: true, reason: 'ja_rodou_hoje', job_id: existentes[0].id, competencia: comp };
   }
 
   const job = await criarEExecutarJob({
     tipo: 'ciclo_completo',
-    competencia: competenciaAtual(),
+    competencia: comp,
     modo: 'automatico',
     dryRun: false,
     codigoOrgao: cfg.codigo_orgao || CODIGO_ORGAO_SEMCAS
   });
 
-  return { skipped: false, job };
+  return { skipped: false, job, competencia: comp };
 }
 
 export async function obterJob(id) {

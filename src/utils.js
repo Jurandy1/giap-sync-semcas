@@ -185,14 +185,22 @@ export function parseDataBR(str) {
 }
 
 /**
- * Retorna a competência YYYYMM "segura" — mês anterior ao atual.
- * A folha do mês corrente costuma ficar disponível só no fim do mês.
+ * Competência YYYYMM alvo.
+ * - Dias 1–19: mês anterior (folha do mês corrente ainda pode não ter saído).
+ * - Dias 20–31: mês corrente (a folha costuma aparecer no fim do mês).
  */
-export function competenciaAtual() {
-  const d = new Date();
-  const ano = d.getFullYear();
-  const mes = d.getMonth(); // 0-indexed, então getMonth() = mês anterior
-  if (mes === 0) return (ano - 1) * 100 + 12;
+export function competenciaAtual(refDate = new Date()) {
+  const d = refDate instanceof Date ? refDate : new Date();
+  const dia = d.getDate();
+  let ano = d.getFullYear();
+  let mes = d.getMonth() + 1; // 1–12
+  if (dia < 20) {
+    mes -= 1;
+    if (mes < 1) {
+      mes = 12;
+      ano -= 1;
+    }
+  }
   return ano * 100 + mes;
 }
 

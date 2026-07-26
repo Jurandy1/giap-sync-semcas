@@ -308,7 +308,8 @@ app.get('/jobs/:id', async (req, res) => {
   }
 });
 
-// Endpoint para Railway Cron (dia 27) — respeita giap_config.automatico
+// Endpoint para cron diário — respeita giap_config.automatico
+// Janela: a partir de dia_mes (padrão 20) até o fim do mês; competência do mês corrente.
 app.post('/cron/mensal', async (req, res) => {
   try {
     const result = await tentarCronMensal();
