@@ -280,24 +280,22 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao, filt
       try {
         let todas = await listarBuscasNomePendentes(competencia);
         const f = filtros || {};
-        const soSemMat = !!f.soSemMatricula;
+        // Padrão = puxar TODOS que ainda não estão na folha (com ou sem matrícula).
+        // Opções só restringem/priorizam — desmarcar tudo NÃO exclui ninguém.
+        const priorizarSemMat = !!f.soSemMatricula || !!f.priorizarSemMatricula;
         const soSemAdm = !!f.soSemAdmissao;
-        const comMat = !!f.incluirComMatricula;
+        const apenasSemMat = !!f.apenasSemMatricula;
         todas = todas.filter((b) => {
           const semMat = !b.tem_matricula;
           const semAdm =
             b.data_admissao == null || String(b.data_admissao).trim() === '';
-          // Quem já tem matrícula mas NÃO está na folha deve entrar
-          // (caso Jurandy / maioria com matrícula no RH).
-          if (soSemAdm && !semAdm && !semMat && !comMat) return false;
-          if (soSemAdm && !semAdm && semMat) return true;
           if (soSemAdm && !semAdm) return false;
-          if (!comMat && !semMat) return false; // só se desmarcar "incluir com matrícula"
+          if (apenasSemMat && !semMat) return false;
           return true;
         });
         // Prioriza sem matrícula se marcado; depois nomes mais longos
         todas.sort((a, b) => {
-          if (soSemMat) {
+          if (priorizarSemMat) {
             const grupo = Number(a.tem_matricula) - Number(b.tem_matricula);
             if (grupo !== 0) return grupo;
           }
@@ -470,26 +468,29 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao, filt
       };
       await updateJob(jobId, { progresso_pct: 30, resumo: { ...resumo, etapa: 'sync_ok' } });
       if (tipo === 'sync_orgao' || tipo === 'sync_folha') {
-        try {
-          const { data: cfg } = await sb()
-            .from('giap_config')
-            .select('competencias_buscadas')
-            .eq('id', 1)
-            .maybeSingle();
-          const lista = Array.isArray(cfg?.competencias_buscadas)
-            ? [...cfg.competencias_buscadas]
-            : [];
-          if (!lista.includes(competencia)) lista.push(competencia);
-          lista.sort((a, b) => b - a);
-          await sb()
-            .from('giap_config')
-            .upsert({
-              id: 1,
-              competencias_buscadas: lista.slice(0, 36),
-              updated_at: new Date().toISOString()
-            });
-        } catch (e) {
-          console.warn('[job] marcar competencia buscada:', e.message);
+        // Só marca a competência como "buscada" quando não restam nomes pendentes
+        if (buscasPendentes === 0) {
+          try {
+            const { data: cfg } = await sb()
+              .from('giap_config')
+              .select('competencias_buscadas')
+              .eq('id', 1)
+              .maybeSingle();
+            const lista = Array.isArray(cfg?.competencias_buscadas)
+              ? [...cfg.competencias_buscadas]
+              : [];
+            if (!lista.includes(competencia)) lista.push(competencia);
+            lista.sort((a, b) => b - a);
+            await sb()
+              .from('giap_config')
+              .upsert({
+                id: 1,
+                competencias_buscadas: lista.slice(0, 36),
+                updated_at: new Date().toISOString()
+              });
+          } catch (e) {
+            console.warn('[job] marcar competencia buscada:', e.message);
+          }
         }
         await updateJob(jobId, {
           status: 'done',
@@ -497,7 +498,11 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao, filt
           processados: (syncRes.registros_encontrados || 0) + extras + extrasNomes,
           total: (syncRes.registros_encontrados || 0) + extras + extrasNomes,
           finished_at: new Date().toISOString(),
-          resumo
+          resumo: {
+            ...resumo,
+            etapa: buscasPendentes > 0 ? 'done_parcial' : 'done',
+            sync: resumo.sync
+          }
         });
         running.delete(jobId);
         return;
