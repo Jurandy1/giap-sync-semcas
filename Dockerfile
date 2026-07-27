@@ -7,9 +7,12 @@ WORKDIR /app
 ENV PUPPETEER_CACHE_DIR=/home/pptruser/.cache/puppeteer
 ENV PUPPETEER_DOCKER=1
 ENV NODE_ENV=production
-ENV NODE_OPTIONS=--max-old-space-size=192
-ENV GIAP_MAX_BUSCAS_NOME=20
-ENV GIAP_BROWSER_RESTART_EVERY=20
+# Plano free ~512MB: heap Node baixo + lotes curtos + Chrome reinicia sempre
+ENV NODE_OPTIONS="--max-old-space-size=128 --expose-gc"
+ENV GIAP_MAX_BUSCAS_NOME=3
+ENV GIAP_MAX_VARIANTES_NOME=1
+ENV GIAP_BROWSER_RESTART_EVERY=1
+ENV GIAP_CLOSE_BROWSER_EVERY_NOME=1
 ENV PORT=3000
 
 COPY package*.json ./

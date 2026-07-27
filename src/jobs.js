@@ -15,13 +15,13 @@ import { competenciaAtual } from './utils.js';
 import { closeBrowser } from './scraper.js';
 
 /** Limite de buscas por nome por execução (Render free 512MB). */
-const MAX_BUSCAS_NOME = Math.max(0, Number(process.env.GIAP_MAX_BUSCAS_NOME || 8));
+const MAX_BUSCAS_NOME = Math.max(0, Number(process.env.GIAP_MAX_BUSCAS_NOME || 3));
 /** No free tier: 1 = só nome completo (evita 5 scrapes/pessoa). */
 const MAX_VARIANTES_NOME = Math.max(1, Number(process.env.GIAP_MAX_VARIANTES_NOME || 1));
 /** Fecha o Chrome a cada N pessoas (libera RAM). */
 const CLOSE_BROWSER_EVERY_NOME = Math.max(
   1,
-  Number(process.env.GIAP_CLOSE_BROWSER_EVERY_NOME || 2)
+  Number(process.env.GIAP_CLOSE_BROWSER_EVERY_NOME || 1)
 );
 
 /** Varredura A–Z desligada por padrão — busca por nome completo é mais precisa.
@@ -191,23 +191,66 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao, filt
     // 1) Sync órgão (ciclo / sync_orgao / sync_folha = só grava buscas)
     if (tipo === 'ciclo_completo' || tipo === 'sync_orgao' || tipo === 'sync_folha') {
       await setProgress(0, 0, 'sync_orgao');
-      const syncRes = await comTimeout(
-        syncPorOrgao({
-          codigoOrgao: String(codigoOrgao),
-          codigoInstituicao: 1,
-          competencia
-        }),
-        SCRAPE_WATCHDOG_MS,
-        'sync_orgao'
-      ).catch(async (err) => {
+
+      // Se a folha da competência já tem gente, pula o scrape pesado do órgão
+      // (cada reopen do Chrome no free tier arrisca OOM).
+      let folhaAntes = 0;
+      try {
+        const { count } = await sb()
+          .from('folha_pmsl')
+          .select('id', { count: 'exact', head: true })
+          .eq('competencia', competencia)
+          .or(`lotacao.eq.SEMCAS,codigo_orgao.eq.${codigoOrgao}`);
+        folhaAntes = count || 0;
+      } catch {
+        /* ignore */
+      }
+
+      const pularOrgao =
+        process.env.GIAP_SKIP_ORGAO_SE_FOLHA === '0'
+          ? false
+          : folhaAntes >= Math.max(1, Number(process.env.GIAP_FOLHA_MIN_SKIP_ORGAO || 30));
+
+      let syncRes = {
+        success: true,
+        registros_encontrados: 0,
+        registros_filtrados: 0,
+        registros_inseridos: 0,
+        pulou_orgao: pularOrgao,
+        folha_antes: folhaAntes
+      };
+
+      if (!pularOrgao) {
+        syncRes = await comTimeout(
+          syncPorOrgao({
+            codigoOrgao: String(codigoOrgao),
+            codigoInstituicao: 1,
+            competencia
+          }),
+          SCRAPE_WATCHDOG_MS,
+          'sync_orgao'
+        ).catch(async (err) => {
+          await closeBrowser().catch(() => {});
+          throw err;
+        });
+        syncRes.pulou_orgao = false;
+        syncRes.folha_antes = folhaAntes;
+        // Libera Chrome antes das buscas por nome
         await closeBrowser().catch(() => {});
-        throw err;
-      });
+      } else {
+        await updateJob(jobId, {
+          progresso_pct: 15,
+          resumo: {
+            ...resumo,
+            etapa: `skip_orgao_folha_${folhaAntes}`
+          }
+        });
+      }
+
       // GIAP limita a ~100 — completa com A–Z só se a folha ainda estiver magra
       let extras = 0;
       let letrasFeitas = 0;
       let pulouLetras = false;
-      let folhaAntes = 0;
       try {
         const { count } = await sb()
           .from('folha_pmsl')

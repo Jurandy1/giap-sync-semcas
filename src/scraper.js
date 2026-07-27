@@ -29,10 +29,10 @@ let remPage = null; // página reutilizada (evita reload do portal a cada busca)
 let scrapesDesdeRestart = 0;
 let browserLock = Promise.resolve(); // serializa scrapes (evita 2 Chrome no free tier)
 
-/** Reinicia o Chrome a cada N consultas (free tier: baixo). */
+/** Reinicia o Chrome a cada N consultas (free tier: 1 = sempre). */
 const BROWSER_RESTART_EVERY = Math.max(
   1,
-  Number(process.env.GIAP_BROWSER_RESTART_EVERY || 3)
+  Number(process.env.GIAP_BROWSER_RESTART_EVERY || 1)
 );
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
