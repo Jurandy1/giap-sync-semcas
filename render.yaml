@@ -23,4 +23,8 @@ services:
         value: "1"
       - key: GIAP_CLOSE_BROWSER_EVERY_NOME
         value: "1"
+      - key: GIAP_AUTO_CONTINUAR
+        value: "1"
+      - key: GIAP_CONTINUAR_DELAY_MS
+        value: "10000"
       # API_KEY, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY: cadastre no Dashboard

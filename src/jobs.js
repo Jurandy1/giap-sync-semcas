@@ -24,6 +24,14 @@ const CLOSE_BROWSER_EVERY_NOME = Math.max(
   Number(process.env.GIAP_CLOSE_BROWSER_EVERY_NOME || 1)
 );
 
+/** Encadeia lotes no servidor (continua com o navegador fechado). */
+const AUTO_CONTINUAR = process.env.GIAP_AUTO_CONTINUAR !== '0';
+const CONTINUAR_DELAY_MS = Math.max(
+  3000,
+  Number(process.env.GIAP_CONTINUAR_DELAY_MS || 10000)
+);
+const MAX_CADEIA = Math.max(1, Number(process.env.GIAP_MAX_CONTINUACOES || 400));
+
 /** Varredura A–Z desligada por padrão — busca por nome completo é mais precisa.
  *  Reative com GIAP_SYNC_LETRAS=1 se precisar engordar a folha em massa. */
 const SYNC_LETRAS_ATIVO = process.env.GIAP_SYNC_LETRAS === '1';
@@ -41,6 +49,18 @@ const SCRAPE_WATCHDOG_MS = Math.max(
 );
 
 const running = new Map(); // jobId -> promise
+/** Quando true, não agenda próximo lote (Parar lotes no RH). */
+let cadeiaCancelada = false;
+
+export function cancelarCadeiaContinua() {
+  cadeiaCancelada = true;
+  console.log('[jobs] cadeia de lotes cancelada pelo usuário');
+  return { ok: true, cadeiaCancelada: true };
+}
+
+export function resetCadeiaContinua() {
+  cadeiaCancelada = false;
+}
 
 function sb() {
   return getSupabase();
@@ -97,12 +117,20 @@ export async function criarEExecutarJob({
   dryRun = false,
   createdBy = null,
   codigoOrgao = CODIGO_ORGAO_SEMCAS,
-  filtros = null
+  filtros = null,
+  limparOrfaos = true
 } = {}) {
   const comp = Number(competencia || competenciaAtual());
 
+  if (modo !== 'continuar') {
+    resetCadeiaContinua();
+  }
+
   // Jobs órfãos (Render OOM/restart) ficam "running" — cancela ao iniciar outro
-  await limparJobsOrfaos('Interrompido ou substituído por novo job (serviço reiniciou/OOM).');
+  // (em lotes de continuação não limpa: o job anterior já está "done")
+  if (limparOrfaos !== false) {
+    await limparJobsOrfaos('Interrompido ou substituído por novo job (serviço reiniciou/OOM).');
+  }
 
   const { data: job, error } = await sb()
     .from('giap_jobs')
@@ -135,6 +163,81 @@ export async function criarEExecutarJob({
   running.set(job.id, promise);
 
   return job;
+}
+
+/**
+ * Agenda o próximo lote no próprio servidor (2º plano).
+ * Assim o usuário pode fechar o navegador.
+ */
+async function agendarProximoLote({
+  tipo,
+  competencia,
+  dryRun,
+  codigoOrgao,
+  filtros,
+  jobAnteriorId,
+  pendentesEstimados
+}) {
+  if (!AUTO_CONTINUAR) return null;
+  if (filtros?.continuarAteCompletar === false) return null;
+  if (cadeiaCancelada) {
+    console.log('[jobs] continuação cancelada (flag parar)');
+    return null;
+  }
+
+  const cadeia = Number(filtros?._cadeia || 0) + 1;
+  if (cadeia > MAX_CADEIA) {
+    console.warn('[jobs] max cadeia atingida', { cadeia, MAX_CADEIA, jobAnteriorId });
+    return null;
+  }
+
+  console.log(
+    `[jobs] agendando continuação #${cadeia} em ${CONTINUAR_DELAY_MS}ms ` +
+      `(após job #${jobAnteriorId}, pendentes≈${pendentesEstimados})`
+  );
+
+  await new Promise((r) => setTimeout(r, CONTINUAR_DELAY_MS));
+  await closeBrowser().catch(() => {});
+
+  if (cadeiaCancelada) {
+    console.log('[jobs] continuação cancelada após espera (flag parar)');
+    return null;
+  }
+
+  // Se o usuário (ou o cron) já disparou outro job, não empilha
+  const { count: ativos } = await sb()
+    .from('giap_jobs')
+    .select('id', { count: 'exact', head: true })
+    .in('status', ['pending', 'running']);
+  if ((ativos || 0) > 0) {
+    console.log('[jobs] continuação cancelada: já existe job ativo');
+    return null;
+  }
+
+  try {
+    const ainda = await listarBuscasNomePendentes(competencia);
+    if (!ainda.length) {
+      console.log('[jobs] continuação cancelada: ninguém pendente');
+      return null;
+    }
+  } catch (e) {
+    console.warn('[jobs] checagem pendentes falhou, segue mesmo assim:', e.message);
+  }
+
+  return criarEExecutarJob({
+    tipo,
+    competencia,
+    modo: 'continuar',
+    dryRun,
+    codigoOrgao,
+    limparOrfaos: false,
+    filtros: {
+      ...(filtros || {}),
+      _cadeia: cadeia,
+      continuarAteCompletar: true,
+      _job_anterior: jobAnteriorId
+    }
+  });
 }
 
 async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao, filtros = {} }) {
@@ -544,10 +647,25 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao, filt
           resumo: {
             ...resumo,
             etapa: buscasPendentes > 0 ? 'done_parcial' : 'done',
-            sync: resumo.sync
+            sync: resumo.sync,
+            continuara: buscasPendentes > 0 && AUTO_CONTINUAR && filtros?.continuarAteCompletar !== false
           }
         });
         running.delete(jobId);
+        await closeBrowser().catch(() => {});
+
+        // 2º plano: próximo lote no servidor (navegador pode fechar)
+        if (buscasPendentes > 0) {
+          agendarProximoLote({
+            tipo,
+            competencia,
+            dryRun,
+            codigoOrgao,
+            filtros,
+            jobAnteriorId: jobId,
+            pendentesEstimados: buscasPendentes
+          }).catch((e) => console.error('[jobs] falha ao continuar lote:', e.message || e));
+        }
         return;
       }
     }

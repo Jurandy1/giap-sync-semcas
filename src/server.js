@@ -9,7 +9,7 @@ import {
 import { scrapeRemuneracoes, scrapeOrgaos, closeBrowser } from './scraper.js';
 import { competenciaAtual, validarCompetencia } from './utils.js';
 import { enriquecerFuncionarios, aplicarExoneracoes, CODIGO_ORGAO_SEMCAS } from './rhsemcas.js';
-import { criarEExecutarJob, obterJob, tentarCronMensal, limparJobsOrfaos } from './jobs.js';
+import { criarEExecutarJob, obterJob, tentarCronMensal, limparJobsOrfaos, cancelarCadeiaContinua } from './jobs.js';
 
 const app = express();
 app.use(express.json({ limit: '2mb' }));
@@ -294,6 +294,17 @@ app.post('/jobs', async (req, res) => {
     res.status(202).json({ ok: true, job });
   } catch (e) {
     console.error('[/jobs]', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/** Para a sequência automática de lotes (próximos não iniciam). O lote atual termina. */
+app.post('/jobs/parar-cadeia', async (_req, res) => {
+  try {
+    const result = cancelarCadeiaContinua();
+    res.json(result);
+  } catch (e) {
+    console.error('[/jobs/parar-cadeia]', e);
     res.status(500).json({ error: e.message });
   }
 });
