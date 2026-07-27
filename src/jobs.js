@@ -425,26 +425,9 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao, filt
       matriculasBusca = new Map();
       try {
         let todas = await listarBuscasNomePendentes(competencia);
-        const f = filtros || {};
-        // Padrão = puxar TODOS que ainda não estão na folha (com ou sem matrícula).
-        // Opções só restringem/priorizam — desmarcar tudo NÃO exclui ninguém.
-        const priorizarSemMat = !!f.soSemMatricula || !!f.priorizarSemMatricula;
-        const soSemAdm = !!f.soSemAdmissao;
-        const apenasSemMat = !!f.apenasSemMatricula;
-        todas = todas.filter((b) => {
-          const semMat = !b.tem_matricula;
-          const semAdm =
-            b.data_admissao == null || String(b.data_admissao).trim() === '';
-          if (soSemAdm && !semAdm) return false;
-          if (apenasSemMat && !semMat) return false;
-          return true;
-        });
-        // Prioriza sem matrícula se marcado; depois nomes mais longos
+        // Sempre TODOS os elegíveis que ainda não estão na folha
+        // (com/sem matrícula ou admissão — listarBuscasNomePendentes já exclui Terceirizado/PROCAD).
         todas.sort((a, b) => {
-          if (priorizarSemMat) {
-            const grupo = Number(a.tem_matricula) - Number(b.tem_matricula);
-            if (grupo !== 0) return grupo;
-          }
           return (
             (b.variantes?.[0] || b.busca || '').split(' ').length -
             (a.variantes?.[0] || a.busca || '').split(' ').length
