@@ -1,5 +1,6 @@
 import puppeteer from 'puppeteer';
 import fs from 'fs';
+import path from 'path';
 
 const PORTAL_URL = 'https://saoluis.giap.com.br/ords/saoluis/f?p=1618:6';
 
@@ -28,6 +29,7 @@ let browserInstance = null;
 let remPage = null; // página reutilizada (evita reload do portal a cada busca)
 let scrapesDesdeRestart = 0;
 let browserLock = Promise.resolve(); // serializa scrapes (evita 2 Chrome no free tier)
+let chromePathCache = undefined; // undefined=ainda não buscou; null=não achou
 
 /** Reinicia o Chrome a cada N consultas (free tier: 1 = sempre). */
 const BROWSER_RESTART_EVERY = Math.max(
@@ -56,11 +58,69 @@ function comLockBrowser(fn) {
   return run;
 }
 
-/** Caminhos comuns de Chrome/Chromium em Docker/Linux (fallback). */
-function resolverExecutablePath() {
-  if (process.env.PUPPETEER_EXECUTABLE_PATH) {
-    return process.env.PUPPETEER_EXECUTABLE_PATH;
+/** Procura o binário chrome no cache da imagem Docker (versão pode diferir do package). */
+function acharChromeNoCache(dir, profundidade = 0) {
+  if (!dir || profundidade > 8) return null;
+  try {
+    if (!fs.existsSync(dir)) return null;
+    const entries = fs.readdirSync(dir, { withFileTypes: true });
+    for (const e of entries) {
+      const full = path.join(dir, e.name);
+      if (e.isFile() && (e.name === 'chrome' || e.name === 'google-chrome')) {
+        try {
+          fs.accessSync(full, fs.constants.X_OK);
+          return full;
+        } catch {
+          return full;
+        }
+      }
+      if (e.isDirectory() && !e.name.startsWith('.')) {
+        const hit = acharChromeNoCache(full, profundidade + 1);
+        if (hit) return hit;
+      }
+    }
+  } catch {
+    /* ignore */
   }
+  return null;
+}
+
+/**
+ * Resolve o Chrome da imagem Puppeteer Docker.
+ * Com PUPPETEER_SKIP_DOWNLOAD o package npm não traz o browser — usamos o da imagem.
+ */
+function resolverExecutablePath() {
+  if (chromePathCache !== undefined) return chromePathCache || undefined;
+
+  if (process.env.PUPPETEER_EXECUTABLE_PATH && fs.existsSync(process.env.PUPPETEER_EXECUTABLE_PATH)) {
+    chromePathCache = process.env.PUPPETEER_EXECUTABLE_PATH;
+    return chromePathCache;
+  }
+
+  try {
+    const builtIn = puppeteer.executablePath();
+    if (builtIn && fs.existsSync(builtIn)) {
+      chromePathCache = builtIn;
+      return chromePathCache;
+    }
+  } catch {
+    /* skip download / versão diferente */
+  }
+
+  const caches = [
+    process.env.PUPPETEER_CACHE_DIR,
+    '/home/pptruser/.cache/puppeteer',
+    path.join(process.env.HOME || '', '.cache/puppeteer')
+  ].filter(Boolean);
+
+  for (const cache of caches) {
+    const hit = acharChromeNoCache(cache);
+    if (hit) {
+      chromePathCache = hit;
+      return chromePathCache;
+    }
+  }
+
   const candidatos = [
     '/usr/bin/google-chrome-stable',
     '/usr/bin/google-chrome',
@@ -69,11 +129,16 @@ function resolverExecutablePath() {
   ];
   for (const p of candidatos) {
     try {
-      if (fs.existsSync(p)) return p;
+      if (fs.existsSync(p)) {
+        chromePathCache = p;
+        return chromePathCache;
+      }
     } catch {
       /* ignore */
     }
   }
+
+  chromePathCache = null;
   return undefined;
 }
 
@@ -141,10 +206,15 @@ async function getBrowser() {
         : [])
     ]
   };
-  if (executablePath) {
-    launchOpts.executablePath = executablePath;
-    console.log('[puppeteer] usando executablePath:', executablePath);
+  if (!executablePath) {
+    throw new Error(
+      'Chrome não encontrado na imagem Docker. ' +
+        'Confira se o Runtime é Docker (ghcr.io/puppeteer/puppeteer) e se ' +
+        '/home/pptruser/.cache/puppeteer tem o browser.'
+    );
   }
+  launchOpts.executablePath = executablePath;
+  console.log('[puppeteer] usando executablePath:', executablePath);
 
   try {
     browserInstance = await puppeteer.launch(launchOpts);
