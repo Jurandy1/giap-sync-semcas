@@ -3,12 +3,14 @@ FROM ghcr.io/puppeteer/puppeteer:23.4.0
 USER root
 WORKDIR /app
 
-# Cache do Chrome no home do pptruser (mesmo usuário que roda o app)
+# A imagem oficial já traz Chrome — NÃO baixar de novo no build (estoura Render free).
+ENV PUPPETEER_SKIP_DOWNLOAD=true
+ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
 ENV PUPPETEER_CACHE_DIR=/home/pptruser/.cache/puppeteer
 ENV PUPPETEER_DOCKER=1
 ENV NODE_ENV=production
-# Plano free ~512MB: heap Node baixo + lotes curtos + Chrome reinicia sempre
-ENV NODE_OPTIONS="--max-old-space-size=128 --expose-gc"
+# Plano free ~512MB
+ENV NODE_OPTIONS=--max-old-space-size=128
 ENV GIAP_MAX_BUSCAS_NOME=3
 ENV GIAP_MAX_VARIANTES_NOME=1
 ENV GIAP_BROWSER_RESTART_EVERY=1
@@ -19,7 +21,6 @@ ENV PORT=3000
 
 COPY package*.json ./
 RUN npm ci --omit=dev \
-  && npx puppeteer browsers install chrome \
   && npm cache clean --force \
   && mkdir -p /home/pptruser/.cache/puppeteer \
   && chown -R pptruser:pptruser /home/pptruser/.cache /app
