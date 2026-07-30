@@ -357,9 +357,12 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao, filt
       }
 
       // GIAP limita a ~100 — completa com A–Z só se a folha ainda estiver magra
+      // Auditoria pode forçar letras (filtros.forcarLetras) sem ligar GIAP_SYNC_LETRAS no Render.
       let extras = 0;
       let letrasFeitas = 0;
       let pulouLetras = false;
+      const forcarLetras = filtros?.forcarLetras === true;
+      const pularBuscasNome = filtros?.pularBuscasNome === true;
       try {
         const { count } = await sb()
           .from('folha_pmsl')
@@ -371,13 +374,13 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao, filt
         /* ignore */
       }
 
-      if (!SYNC_LETRAS_ATIVO) {
+      if (!SYNC_LETRAS_ATIVO && !forcarLetras) {
         pulouLetras = true;
         await updateJob(jobId, {
           progresso_pct: 20,
           resumo: { ...resumo, etapa: 'skip_letras_desativado' }
         });
-      } else if (folhaAntes >= FOLHA_MIN_SKIP_LETRAS) {
+      } else if (!forcarLetras && folhaAntes >= FOLHA_MIN_SKIP_LETRAS) {
         pulouLetras = true;
         await updateJob(jobId, {
           progresso_pct: 20,
@@ -430,17 +433,23 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao, filt
       verificadosNome = new Set();
       matriculasBusca = new Map();
       try {
-        let todas = await listarBuscasNomePendentes(competencia);
-        // Sempre TODOS os elegíveis que ainda não estão na folha
-        // (com/sem matrícula ou admissão — listarBuscasNomePendentes já exclui Terceirizado/PROCAD).
-        todas.sort((a, b) => {
-          return (
-            (b.variantes?.[0] || b.busca || '').split(' ').length -
-            (a.variantes?.[0] || a.busca || '').split(' ').length
-          );
-        });
-        buscasPendentes = Math.max(0, todas.length - MAX_BUSCAS_NOME);
-        buscasNome = todas.slice(0, MAX_BUSCAS_NOME);
+        if (pularBuscasNome) {
+          // Snapshot de auditoria: só órgão (+ letras se pedidas). Sem fila de 900 nomes.
+          buscasNome = [];
+          buscasPendentes = 0;
+        } else {
+          let todas = await listarBuscasNomePendentes(competencia);
+          // Sempre TODOS os elegíveis que ainda não estão na folha
+          // (com/sem matrícula ou admissão — listarBuscasNomePendentes já exclui Terceirizado/PROCAD).
+          todas.sort((a, b) => {
+            return (
+              (b.variantes?.[0] || b.busca || '').split(' ').length -
+              (a.variantes?.[0] || a.busca || '').split(' ').length
+            );
+          });
+          buscasPendentes = Math.max(0, todas.length - MAX_BUSCAS_NOME);
+          buscasNome = todas.slice(0, MAX_BUSCAS_NOME);
+        }
       } catch (err) {
         console.warn('[jobs] listar buscas nome', err.message);
       }
