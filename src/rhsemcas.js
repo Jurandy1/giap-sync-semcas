@@ -819,16 +819,22 @@ export async function aplicarExoneracoes({
 
 /**
  * Demissões p/ Comissionados e Contratos (exclui Efetivo, Serviço Prestado e terceirizados).
- * Cruza folha_pmsl das competências recentes; se faltar, busca nome na competência alvo.
+ *
+ * 1) Cruza folha_pmsl já gravada (competências recentes) em busca de demissão.
+ * 2) Quem NÃO tiver demissão no banco → consulta a API mês a mês (atual → mais antigo)
+ *    até achar demissão ou esgotar os meses — sem teto artificial de 8 scrapes.
  */
 export async function buscarDemissoesVinculos({
   competencia,
   dryRun = true,
   jobId = null,
   mesesAtras = 12,
-  onProgress = null
+  onProgress = null,
+  /** Se true (padrão), só insiste na API em quem NÃO está na folha da competência atual. */
+  soForaDaFolhaAtual = true
 } = {}) {
   const { syncPorNome } = await import('./sync.js');
+  const pause = (ms) => new Promise((r) => setTimeout(r, ms));
 
   const VINCULOS_DEM = new Set(
     ['COMISSIONADO', 'CONTRATO SEMUS', 'CONTRATO TEMPORARIO'].map(normalizarCategoria)
@@ -863,7 +869,7 @@ export async function buscarDemissoesVinculos({
   );
   const alvos = (funcs || []).filter((f) => idsAlvo.has(f.id));
 
-  // Competências a vasculhar na folha já baixada
+  // Competências: atual → mais antigas
   const comps = [];
   let c = Number(competencia);
   for (let i = 0; i < Math.max(1, mesesAtras); i++) {
@@ -878,6 +884,31 @@ export async function buscarDemissoesVinculos({
     c = y * 100 + m;
   }
 
+  // Folha da competência atual (pra saber quem "não foi encontrado")
+  const matsFolhaAtual = new Set();
+  const nomesFolhaAtual = new Set();
+  {
+    const folhaAtual = await selectTudo(() =>
+      sb()
+        .from('folha_pmsl')
+        .select('matricula, funcionario, funcionario_norm')
+        .eq('competencia', Number(competencia))
+        .order('id')
+    );
+    for (const row of folhaAtual || []) {
+      if (row.matricula) matsFolhaAtual.add(String(row.matricula).trim());
+      const nn = row.funcionario_norm || normalizarNome(row.funcionario);
+      if (nn) nomesFolhaAtual.add(nn);
+    }
+  }
+
+  const estaNaFolhaAtual = (hr) => {
+    if (!matriculaVazia(hr.matricula) && matsFolhaAtual.has(String(hr.matricula).trim())) return true;
+    const nn = normalizarNome(hr.nome);
+    return !!(nn && nomesFolhaAtual.has(nn));
+  };
+
+  // Demissões já gravadas no banco (qualquer das comps)
   const { data: folhaDem, error: errF } = await sb()
     .from('folha_pmsl')
     .select('matricula, funcionario, funcionario_norm, admissao, demissao, competencia, lotacao, codigo_orgao')
@@ -885,83 +916,146 @@ export async function buscarDemissoesVinculos({
     .not('demissao', 'is', null);
   if (errF) throw errF;
 
-  const porMat = new Map();
-  const porNome = new Map();
+  const porMatDem = new Map();
+  const porNomeDem = new Map();
   for (const row of folhaDem || []) {
-    if (row.matricula) porMat.set(String(row.matricula).trim(), row);
+    if (row.matricula) {
+      const prev = porMatDem.get(String(row.matricula).trim());
+      if (!prev || Number(row.competencia) > Number(prev.competencia)) {
+        porMatDem.set(String(row.matricula).trim(), row);
+      }
+    }
     const nn = row.funcionario_norm || normalizarNome(row.funcionario);
-    if (nn && !porNome.has(nn)) porNome.set(nn, row);
+    if (nn) {
+      const prev = porNomeDem.get(nn);
+      if (!prev || Number(row.competencia) > Number(prev.competencia)) {
+        porNomeDem.set(nn, row);
+      }
+    }
   }
+
+  const acharDemLocal = (hr) => {
+    if (!matriculaVazia(hr.matricula)) {
+      const h = porMatDem.get(String(hr.matricula).trim());
+      if (h) return h;
+    }
+    return porNomeDem.get(normalizarNome(hr.nome)) || null;
+  };
+
+  /** Relê demissão no banco após scrape (por matrícula ou nome). */
+  const lerDemissaoAposScrape = async (hr, compScrape) => {
+    if (!matriculaVazia(hr.matricula)) {
+      const { data: byMat } = await sb()
+        .from('folha_pmsl')
+        .select('matricula, funcionario, admissao, demissao, competencia')
+        .eq('matricula', String(hr.matricula).trim())
+        .not('demissao', 'is', null)
+        .in('competencia', comps)
+        .order('competencia', { ascending: false })
+        .limit(1);
+      if (byMat?.[0]) return byMat[0];
+    }
+    const nn = normalizarNome(hr.nome);
+    if (nn) {
+      const { data: byNome } = await sb()
+        .from('folha_pmsl')
+        .select('matricula, funcionario, admissao, demissao, competencia')
+        .eq('funcionario_norm', nn)
+        .not('demissao', 'is', null)
+        .in('competencia', comps)
+        .order('competencia', { ascending: false })
+        .limit(1);
+      if (byNome?.[0]) return byNome[0];
+    }
+    // Também tenta a competência recém-puxada (demissão pode ter vindo nela)
+    const { data: naComp } = await sb()
+      .from('folha_pmsl')
+      .select('matricula, funcionario, admissao, demissao, competencia, funcionario_norm')
+      .eq('competencia', Number(compScrape))
+      .limit(2000);
+    const mat = !matriculaVazia(hr.matricula) ? String(hr.matricula).trim() : '';
+    const hit = (naComp || []).find((r) => {
+      if (mat && String(r.matricula || '').trim() === mat) return true;
+      return (r.funcionario_norm || normalizarNome(r.funcionario)) === nn;
+    });
+    return hit || null;
+  };
 
   const relatorio = {
     competencia,
     total_alvos: alvos.length,
+    fora_folha_atual: 0,
     com_demissao: 0,
     sem_demissao: 0,
+    confirmados_api: 0,
     scrapes: 0,
+    comps,
     items: []
   };
 
-  const MAX_SCRAPE = Math.max(0, Number(process.env.GIAP_MAX_BUSCAS_NOME || 8));
+  // Sem teto de 8: confirma na API todos os não detectados (limite só por env se quiser).
+  const MAX_SCRAPE = Math.max(0, Number(process.env.GIAP_MAX_BUSCAS_NOME || 5000));
   let scrapesFeitos = 0;
 
   for (let i = 0; i < alvos.length; i++) {
     const hr = alvos[i];
+    const foraAtual = !estaNaFolhaAtual(hr);
+    if (foraAtual) relatorio.fora_folha_atual++;
+
     if (onProgress) {
       await onProgress({
         processados: i + 1,
         total: alvos.length,
-        pct: alvos.length ? Math.round(((i + 1) / alvos.length) * 100) : 100
+        pct: alvos.length ? Math.round(((i + 1) / alvos.length) * 100) : 100,
+        scrapes: scrapesFeitos,
+        etapa: foraAtual ? 'fora_folha' : 'na_folha'
       });
     }
 
-    let hit = null;
-    if (!matriculaVazia(hr.matricula)) {
-      hit = porMat.get(String(hr.matricula).trim()) || null;
-    }
-    if (!hit) {
-      hit = porNome.get(normalizarNome(hr.nome)) || null;
-    }
+    let hit = acharDemLocal(hr);
 
-    // Folha local sem demissão → tenta scrape (limitado) pelo nome completo
-    if (!hit && scrapesFeitos < MAX_SCRAPE && hr.nome) {
-      try {
-        const busca = nomeBuscaGiap(hr.nome);
-        if (busca) {
-          scrapesFeitos++;
-          relatorio.scrapes++;
-          const r = await syncPorNome({
-            nomeServidor: busca,
-            codigoInstituicao: 1,
-            competencia,
-            filtrarNomeAlvo: hr.nome
-          });
-          const comDem = (r.resultado || []).find((x) => x.demissao || x.after_data?.demissao);
-          // resultado do upsert não traz demissao — releitura rápida
-          if ((r.registros_inseridos || 0) > 0 || (r.registros_encontrados || 0) > 0) {
-            const { data: rows } = await sb()
-              .from('folha_pmsl')
-              .select('matricula, funcionario, admissao, demissao, competencia')
-              .eq('competencia', competencia)
-              .eq('funcionario_norm', normalizarNome(hr.nome))
-              .not('demissao', 'is', null)
-              .limit(1);
-            if (rows?.[0]) hit = rows[0];
-            else if (!matriculaVazia(hr.matricula)) {
-              const { data: byMat } = await sb()
-                .from('folha_pmsl')
-                .select('matricula, funcionario, admissao, demissao, competencia')
-                .eq('matricula', String(hr.matricula).trim())
-                .not('demissao', 'is', null)
-                .order('competencia', { ascending: false })
-                .limit(1);
-              if (byMat?.[0]) hit = byMat[0];
+    // Só puxa API para quem NÃO foi encontrado na competência atual
+    // (ou, se soForaDaFolhaAtual=false, para todo mundo sem demissão local)
+    const precisaApi = !hit && (soForaDaFolhaAtual ? foraAtual : true);
+
+    if (precisaApi && scrapesFeitos < MAX_SCRAPE && hr.nome) {
+      const busca = nomeBuscaGiap(hr.nome);
+      if (busca) {
+        for (const compScrape of comps) {
+          if (scrapesFeitos >= MAX_SCRAPE) break;
+          try {
+            scrapesFeitos++;
+            relatorio.scrapes++;
+            if (onProgress) {
+              await onProgress({
+                processados: i + 1,
+                total: alvos.length,
+                pct: alvos.length ? Math.round(((i + 1) / alvos.length) * 100) : 100,
+                scrapes: scrapesFeitos,
+                etapa: `api_${compScrape}`,
+                nome: hr.nome
+              });
             }
+            await syncPorNome({
+              nomeServidor: busca,
+              codigoInstituicao: 1,
+              competencia: compScrape,
+              filtrarNomeAlvo: hr.nome,
+              maxVariantes: 1
+            });
+            const apos = await lerDemissaoAposScrape(hr, compScrape);
+            if (apos?.demissao) {
+              hit = apos;
+              relatorio.confirmados_api++;
+              break;
+            }
+            // Sem demissão neste mês → tenta o mais antigo automaticamente
+          } catch (err) {
+            console.warn('[demissoes] scrape', hr.nome, compScrape, err.message);
+            await pause(2000);
           }
-          void comDem;
+          await pause(800);
         }
-      } catch (err) {
-        console.warn('[demissoes] scrape', hr.nome, err.message);
       }
     }
 
@@ -974,11 +1068,11 @@ export async function buscarDemissoesVinculos({
         demissao: hit.demissao,
         competencia_folha: hit.competencia,
         acao: 'demissao_encontrada',
-        status: 'pending'
+        status: 'pending',
+        fora_folha_atual: foraAtual
       };
-      if (relatorio.items.length < 80) relatorio.items.push(item);
+      if (relatorio.items.length < 200) relatorio.items.push(item);
 
-      // Nunca exonera automático — só ação manual no Relatório API / menu Exonerados
       if (jobId) {
         await sb().from('giap_job_items').insert({
           job_id: jobId,
@@ -986,7 +1080,7 @@ export async function buscarDemissoesVinculos({
           matricula: hr.matricula != null ? String(hr.matricula) : null,
           nome: hr.nome,
           acao: 'demissao_encontrada',
-          before_data: { ativo: true },
+          before_data: { ativo: true, fora_folha_atual: foraAtual },
           after_data: { demissao: hit.demissao, competencia: hit.competencia },
           status: 'pending',
           erro: null

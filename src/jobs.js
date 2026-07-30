@@ -270,12 +270,18 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao, filt
         dryRun,
         jobId,
         mesesAtras: Number(filtros.mesesAtras || 12),
-        onProgress: async ({ processados, total, pct }) => {
+        soForaDaFolhaAtual: filtros.soForaDaFolhaAtual !== false,
+        onProgress: async ({ processados, total, pct, scrapes, etapa, nome }) => {
           await updateJob(jobId, {
             processados,
             total,
             progresso_pct: Math.min(99, Math.round(pct)),
-            resumo: { ...resumo, etapa: 'buscar_demissoes' }
+            resumo: {
+              ...resumo,
+              etapa: etapa || 'buscar_demissoes',
+              scrapes: scrapes || 0,
+              nome: nome || undefined
+            }
           });
         }
       });
