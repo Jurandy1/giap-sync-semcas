@@ -908,13 +908,22 @@ export async function buscarDemissoesVinculos({
     return !!(nn && nomesFolhaAtual.has(nn));
   };
 
-  // Demissões já gravadas no banco (qualquer das comps)
+  // Demissões / aparições já gravadas no banco (qualquer das comps)
   const { data: folhaDem, error: errF } = await sb()
     .from('folha_pmsl')
     .select('matricula, funcionario, funcionario_norm, admissao, demissao, competencia, lotacao, codigo_orgao')
     .in('competencia', comps)
     .not('demissao', 'is', null);
   if (errF) throw errF;
+
+  // Também carrega aparições SEM exigir demissão (pra não scrapar à toa)
+  const folhaTudo = await selectTudo(() =>
+    sb()
+      .from('folha_pmsl')
+      .select('matricula, funcionario, funcionario_norm, admissao, demissao, competencia')
+      .in('competencia', comps)
+      .order('competencia', { ascending: false })
+  );
 
   const porMatDem = new Map();
   const porNomeDem = new Map();
@@ -934,12 +943,32 @@ export async function buscarDemissoesVinculos({
     }
   }
 
+  const porMatUltima = new Map();
+  const porNomeUltima = new Map();
+  for (const row of folhaTudo || []) {
+    if (row.matricula) {
+      const k = String(row.matricula).trim();
+      if (!porMatUltima.has(k)) porMatUltima.set(k, row); // já vem desc por competência
+    }
+    const nn = row.funcionario_norm || normalizarNome(row.funcionario);
+    if (nn && !porNomeUltima.has(nn)) porNomeUltima.set(nn, row);
+  }
+
   const acharDemLocal = (hr) => {
     if (!matriculaVazia(hr.matricula)) {
       const h = porMatDem.get(String(hr.matricula).trim());
       if (h) return h;
     }
     return porNomeDem.get(normalizarNome(hr.nome)) || null;
+  };
+
+  /** Última aparição em qualquer competência (com ou sem demissão). */
+  const acharUltimaLocal = (hr) => {
+    if (!matriculaVazia(hr.matricula)) {
+      const h = porMatUltima.get(String(hr.matricula).trim());
+      if (h) return h;
+    }
+    return porNomeUltima.get(normalizarNome(hr.nome)) || null;
   };
 
   /** Relê demissão no banco após scrape (por matrícula ou nome). */
@@ -993,9 +1022,19 @@ export async function buscarDemissoesVinculos({
     items: []
   };
 
-  // Sem teto de 8: confirma na API todos os não detectados (limite só por env se quiser).
-  const MAX_SCRAPE = Math.max(0, Number(process.env.GIAP_MAX_BUSCAS_NOME || 5000));
+  // GIAP_MAX_BUSCAS_NOME no Render free costuma ser 3 — NÃO usar aqui.
+  // Este job precisa confirmar demissão de todos os "fora da folha".
+  const MAX_SCRAPE = Math.max(
+    0,
+    Number(
+      process.env.GIAP_MAX_BUSCAS_DEMISSAO != null && process.env.GIAP_MAX_BUSCAS_DEMISSAO !== ''
+        ? process.env.GIAP_MAX_BUSCAS_DEMISSAO
+        : 20000
+    )
+  );
   let scrapesFeitos = 0;
+  let alvosApi = 0;
+  let atingiuLimite = false;
 
   for (let i = 0; i < alvos.length; i++) {
     const hr = alvos[i];
@@ -1013,48 +1052,61 @@ export async function buscarDemissoesVinculos({
     }
 
     let hit = acharDemLocal(hr);
+    const ultimaLocal = hit || acharUltimaLocal(hr);
+    if (!hit && ultimaLocal?.demissao) hit = ultimaLocal;
 
-    // Só puxa API para quem NÃO foi encontrado na competência atual
-    // (ou, se soForaDaFolhaAtual=false, para todo mundo sem demissão local)
-    const precisaApi = !hit && (soForaDaFolhaAtual ? foraAtual : true);
+    // API só se: sem demissão no banco E sem nenhuma aparição local nas comps
+    // (se já apareceu sem demissão, não precisa scrapar de novo)
+    const precisaApi =
+      !hit &&
+      !ultimaLocal &&
+      (soForaDaFolhaAtual ? foraAtual : true);
 
-    if (precisaApi && scrapesFeitos < MAX_SCRAPE && hr.nome) {
-      const busca = nomeBuscaGiap(hr.nome);
-      if (busca) {
-        for (const compScrape of comps) {
-          if (scrapesFeitos >= MAX_SCRAPE) break;
-          try {
-            scrapesFeitos++;
-            relatorio.scrapes++;
-            if (onProgress) {
-              await onProgress({
-                processados: i + 1,
-                total: alvos.length,
-                pct: alvos.length ? Math.round(((i + 1) / alvos.length) * 100) : 100,
-                scrapes: scrapesFeitos,
-                etapa: `api_${compScrape}`,
-                nome: hr.nome
-              });
-            }
-            await syncPorNome({
-              nomeServidor: busca,
-              codigoInstituicao: 1,
-              competencia: compScrape,
-              filtrarNomeAlvo: hr.nome,
-              maxVariantes: 1
-            });
-            const apos = await lerDemissaoAposScrape(hr, compScrape);
-            if (apos?.demissao) {
-              hit = apos;
-              relatorio.confirmados_api++;
+    if (precisaApi && hr.nome) {
+      alvosApi++;
+      if (scrapesFeitos >= MAX_SCRAPE) {
+        atingiuLimite = true;
+      } else {
+        const busca = nomeBuscaGiap(hr.nome);
+        if (busca) {
+          for (const compScrape of comps) {
+            if (scrapesFeitos >= MAX_SCRAPE) {
+              atingiuLimite = true;
               break;
             }
-            // Sem demissão neste mês → tenta o mais antigo automaticamente
-          } catch (err) {
-            console.warn('[demissoes] scrape', hr.nome, compScrape, err.message);
-            await pause(2000);
+            try {
+              scrapesFeitos++;
+              relatorio.scrapes++;
+              if (onProgress) {
+                await onProgress({
+                  processados: i + 1,
+                  total: alvos.length,
+                  pct: alvos.length ? Math.round(((i + 1) / alvos.length) * 100) : 100,
+                  scrapes: scrapesFeitos,
+                  etapa: `api_${compScrape}`,
+                  nome: hr.nome
+                });
+              }
+              await syncPorNome({
+                nomeServidor: busca,
+                codigoInstituicao: 1,
+                competencia: compScrape,
+                filtrarNomeAlvo: hr.nome,
+                maxVariantes: 1
+              });
+              const apos = await lerDemissaoAposScrape(hr, compScrape);
+              if (apos?.demissao) {
+                hit = apos;
+                relatorio.confirmados_api++;
+                break;
+              }
+              // Sem demissão neste mês → tenta o mais antigo automaticamente
+            } catch (err) {
+              console.warn('[demissoes] scrape', hr.nome, compScrape, err.message);
+              await pause(2000);
+            }
+            await pause(800);
           }
-          await pause(800);
         }
       }
     }
@@ -1088,8 +1140,24 @@ export async function buscarDemissoesVinculos({
       }
     } else {
       relatorio.sem_demissao++;
+      if (precisaApi && foraAtual && relatorio.items.length < 200) {
+        relatorio.items.push({
+          funcionario_id: hr.id,
+          nome: hr.nome,
+          matricula: hr.matricula,
+          demissao: null,
+          competencia_folha: null,
+          acao: 'sem_demissao_apos_busca',
+          status: atingiuLimite && scrapesFeitos >= MAX_SCRAPE ? 'limitado' : 'pending',
+          fora_folha_atual: true
+        });
+      }
     }
   }
+
+  relatorio.alvos_api = alvosApi;
+  relatorio.max_scrape = MAX_SCRAPE;
+  relatorio.atingiu_limite_scrape = atingiuLimite;
 
   return relatorio;
 }
