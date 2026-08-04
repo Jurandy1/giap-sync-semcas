@@ -1185,7 +1185,24 @@ export async function auditarSaidas({
   jobId = null
 } = {}) {
   const { syncPorNome } = await import('./sync.js');
+  const { closeBrowser } = await import('./scraper.js');
   const pause = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  // Envelope de segurança: se o Puppeteer congelar, força saída, fecha Chrome
+  // e o loop segue pro próximo mês/pessoa.
+  const scrapeWatchdogMs = Math.max(60000, Number(process.env.GIAP_SCRAPE_WATCHDOG_MS || 180000));
+  const scrapeComTimeout = (promise, label) => {
+    let timer;
+    return Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`watchdog: ${label} não respondeu em ${Math.round(scrapeWatchdogMs / 1000)}s`)),
+          scrapeWatchdogMs
+        );
+      })
+    ]).finally(() => clearTimeout(timer));
+  };
 
   const refN = Number(compRef);
   const pisoN = Number(compPiso);
@@ -1416,6 +1433,7 @@ export async function auditarSaidas({
 
     const busca = nomeBuscaGiap(hr.nome);
     let acharado = null;
+    let watchdogsSeguidos = 0;
     if (busca) {
       for (const compScrape of compsAnteriores) {
         try {
@@ -1433,21 +1451,35 @@ export async function auditarSaidas({
               });
             } catch (_) { /* ok */ }
           }
-          await syncPorNome({
-            nomeServidor: busca,
-            codigoInstituicao: 1,
-            competencia: compScrape,
-            filtrarNomeAlvo: hr.nome,
-            apenasSemcas: false, // exonerado pode ter migrado antes; queremos qualquer aparição
-            maxVariantes: 1
-          });
+          await scrapeComTimeout(
+            syncPorNome({
+              nomeServidor: busca,
+              codigoInstituicao: 1,
+              competencia: compScrape,
+              filtrarNomeAlvo: hr.nome,
+              apenasSemcas: false, // exonerado pode ter migrado antes; queremos qualquer aparição
+              maxVariantes: 1
+            }),
+            `sync_nome_${busca}@${compScrape}`
+          );
           const apos = await lerAposScrape(hr, compScrape);
+          watchdogsSeguidos = 0;
           if (apos) {
             acharado = { ...apos, competencia: Number(apos.competencia) };
             break;
           }
         } catch (err) {
           console.warn('[aud] scrape', hr.nome, compScrape, err.message);
+          // Watchdog / erro de frame → derruba o Chromium; a próxima iteração recria.
+          if (/watchdog|main frame|Target closed|detached Frame|Session closed|Protocol error|Execution context/i.test(err.message || '')) {
+            await closeBrowser().catch(() => {});
+            watchdogsSeguidos++;
+            // Portal instável demais para esta pessoa — desiste e passa pra próxima.
+            if (watchdogsSeguidos >= 3) {
+              console.warn('[aud] 3 watchdogs seguidos em', hr.nome, '→ pula pessoa');
+              break;
+            }
+          }
           await pause(1500);
         }
         await pause(500);
