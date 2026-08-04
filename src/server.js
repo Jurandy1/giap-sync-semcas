@@ -275,7 +275,8 @@ app.post('/jobs', async (req, res) => {
       'exoneracoes',
       'sync_orgao',
       'sync_folha',
-      'buscar_demissoes'
+      'buscar_demissoes',
+      'auditoria_saidas'
     ];
     if (!tiposOk.includes(tipo)) {
       return res.status(400).json({ error: `tipo inválido. Use: ${tiposOk.join(', ')}` });

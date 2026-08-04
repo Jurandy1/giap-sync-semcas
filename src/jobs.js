@@ -9,6 +9,7 @@ import {
   getSupabase,
   listarBuscasNomePendentes,
   buscarDemissoesVinculos,
+  auditarSaidas,
   carregarCedenciasAtuais
 } from './rhsemcas.js';
 import { competenciaAtual } from './utils.js';
@@ -214,14 +215,21 @@ async function agendarProximoLote({
     return null;
   }
 
-  try {
-    const ainda = await listarBuscasNomePendentes(competencia);
-    if (!ainda.length) {
-      console.log('[jobs] continuação cancelada: ninguém pendente');
-      return null;
+  // Auditoria de saídas tem sua própria lista de pendentes (filtros.pendentes_ids);
+  // a checagem via listarBuscasNomePendentes é da Conferência de folha.
+  if (tipo !== 'auditoria_saidas') {
+    try {
+      const ainda = await listarBuscasNomePendentes(competencia);
+      if (!ainda.length) {
+        console.log('[jobs] continuação cancelada: ninguém pendente');
+        return null;
+      }
+    } catch (e) {
+      console.warn('[jobs] checagem pendentes falhou, segue mesmo assim:', e.message);
     }
-  } catch (e) {
-    console.warn('[jobs] checagem pendentes falhou, segue mesmo assim:', e.message);
+  } else if (!(filtros?.pendentes_ids?.length)) {
+    console.log('[jobs] continuação de auditoria cancelada: sem pendentes_ids');
+    return null;
   }
 
   return criarEExecutarJob({
@@ -261,6 +269,150 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao, filt
         resumo: { ...resumo, etapa: label }
       });
     };
+
+    // 0a) Auditoria de saídas — dirigida por pessoa, com checkpoint retomável.
+    if (tipo === 'auditoria_saidas') {
+      const compRef = Number(filtros.compRef || competencia);
+      const compPiso = Number(filtros.compPiso || competencia);
+      const escopo = filtros.escopo || 'todos_ativos';
+      const pendentesIds = Array.isArray(filtros.pendentes_ids) ? filtros.pendentes_ids : null;
+      const loteMax = Math.max(1, Number(process.env.GIAP_AUD_LOTE || 25));
+      // Todos os lotes desta auditoria compartilham um job_raiz (o id do primeiro lote).
+      const jobRaiz = Number(filtros._job_raiz || jobId);
+
+      await setProgress(0, 0, pendentesIds ? 'auditoria_continua' : 'auditoria_inicio');
+
+      // 1º lote: se folha do compRef está magra, dispara sync_orgao (uma vez).
+      // Não usa forcarLetras (o A-Z pesado ficou pra lá — a estratégia agora é
+      // por nome individual só pra quem faltou).
+      if (!pendentesIds) {
+        let folhaRef = 0;
+        try {
+          const { count } = await sb()
+            .from('folha_pmsl')
+            .select('id', { count: 'exact', head: true })
+            .eq('competencia', compRef);
+          folhaRef = count || 0;
+        } catch { /* ok */ }
+        if (folhaRef < Math.max(1, Number(process.env.GIAP_FOLHA_MIN_SKIP_ORGAO || 30))) {
+          try {
+            await comTimeout(
+              syncPorOrgao({
+                codigoOrgao: String(codigoOrgao),
+                codigoInstituicao: 1,
+                competencia: compRef
+              }),
+              SCRAPE_WATCHDOG_MS,
+              'auditoria_sync_orgao'
+            );
+          } catch (e) {
+            console.warn('[aud] sync_orgao compRef falhou (segue):', e.message);
+          }
+          await closeBrowser().catch(() => {});
+        }
+      }
+
+      const auditRes = { comps: [], stats: {}, pendentesIds: [], concluido: true };
+
+      const onResultado = async (v) => {
+        try {
+          await sb()
+            .from('giap_auditoria_saidas')
+            .upsert(
+              {
+                job_id: jobRaiz,
+                funcionario_id: v.funcionario_id,
+                matricula: v.matricula,
+                nome: v.nome,
+                status: v.status,
+                competencia: v.competencia,
+                demissao: v.demissao,
+                fonte: v.fonte,
+                updated_at: new Date().toISOString()
+              },
+              { onConflict: 'job_id,funcionario_id' }
+            );
+        } catch (e) {
+          console.warn('[aud] upsert giap_auditoria_saidas', v.nome, e.message);
+        }
+      };
+
+      try {
+        const r = await auditarSaidas({
+          compRef,
+          compPiso,
+          escopo,
+          pendentesIds,
+          loteMax,
+          jobId,
+          onResultado,
+          onProgress: async ({ processados, total, pct, scrapes, etapa, nome }) => {
+            await updateJob(jobId, {
+              processados,
+              total,
+              progresso_pct: Math.min(99, Math.round(pct)),
+              resumo: {
+                ...resumo,
+                etapa: etapa || 'auditoria',
+                scrapes: scrapes || 0,
+                nome: nome || undefined,
+                compRef,
+                compPiso,
+                escopo
+              }
+            });
+          }
+        });
+        Object.assign(auditRes, r);
+      } catch (e) {
+        await closeBrowser().catch(() => {});
+        throw e;
+      }
+
+      resumo.auditoria = {
+        compRef,
+        compPiso,
+        escopo,
+        job_raiz: jobRaiz,
+        stats: auditRes.stats,
+        pendentes_ids: auditRes.pendentesIds,
+        concluido: auditRes.concluido,
+        cadeia: Number(filtros?._cadeia || 0)
+      };
+
+      await closeBrowser().catch(() => {});
+      await updateJob(jobId, {
+        status: 'done',
+        progresso_pct: auditRes.concluido ? 100 : 90,
+        finished_at: new Date().toISOString(),
+        resumo: { ...resumo, etapa: auditRes.concluido ? 'auditoria_done' : 'auditoria_lote_ok' }
+      });
+      running.delete(jobId);
+
+      // Continuação em 2º plano (o navegador pode estar fechado)
+      if (!auditRes.concluido && auditRes.pendentesIds.length) {
+        agendarProximoLote({
+          tipo,
+          competencia: compRef,
+          dryRun,
+          codigoOrgao,
+          filtros: {
+            ...(filtros || {}),
+            compRef,
+            compPiso,
+            escopo,
+            _job_raiz: jobRaiz,
+            pendentes_ids: auditRes.pendentesIds
+          },
+          jobAnteriorId: jobId,
+          pendentesEstimados: auditRes.pendentesIds.length
+        }).catch((e) => console.error('[jobs] falha ao continuar auditoria:', e.message || e));
+      }
+      // Front acha a última auditoria pelo próprio giap_jobs
+      // (tipo='auditoria_saidas', status='done', maior id) — resumo.auditoria.job_raiz
+      // aponta para o job_id na tabela giap_auditoria_saidas.
+      return;
+    }
 
     // 0) Busca demissões (comissionados/contratos — sem Efetivo/SP/terceirizado)
     if (tipo === 'buscar_demissoes') {

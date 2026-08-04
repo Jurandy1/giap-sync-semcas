@@ -1162,4 +1162,321 @@ export async function buscarDemissoesVinculos({
   return relatorio;
 }
 
+/**
+ * Auditoria de saídas: dado um intervalo [compPiso, compRef], responde por
+ * cada RH ativo qual a última competência em que apareceu no GIAP e se veio
+ * com demissao. Estratégia:
+ *   1) Quem está na folha de compRef → status "ativo_compref", zero scrape.
+ *   2) Faltantes → syncPorNome mês a mês (compRef-1 → compPiso), para na
+ *      primeira aparição (com/sem demissao). Se apareceu com demissao →
+ *      "candidato_exo"; sem demissao → "sumiu"; nunca apareceu → "sem_historico".
+ *   3) Suporta continuação via pendentesIds (checkpoint em giap_jobs.resumo).
+ *   4) onResultado(veredito) é chamado após cada pessoa — o job persiste em
+ *      giap_auditoria_saidas.
+ */
+export async function auditarSaidas({
+  compRef,
+  compPiso,
+  escopo = 'todos_ativos',
+  pendentesIds = null,
+  loteMax = 25,
+  onResultado = null,
+  onProgress = null,
+  jobId = null
+} = {}) {
+  const { syncPorNome } = await import('./sync.js');
+  const pause = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  const refN = Number(compRef);
+  const pisoN = Number(compPiso);
+  if (!refN || !pisoN || pisoN > refN) {
+    throw new Error(`Intervalo inválido: compRef=${compRef}, compPiso=${compPiso}`);
+  }
+
+  const comps = [];
+  {
+    let c = refN;
+    while (c >= pisoN) {
+      comps.push(c);
+      let y = Math.floor(c / 100);
+      let m = c % 100;
+      m -= 1;
+      if (m < 1) { m = 12; y -= 1; }
+      c = y * 100 + m;
+    }
+  }
+  const compsAnteriores = comps.slice(1); // compRef-1 → compPiso (o mais novo primeiro)
+
+  // ————————————————— alvos —————————————————
+  let alvos = [];
+  const preselecionados = pendentesIds && pendentesIds.length;
+
+  if (preselecionados) {
+    const idsWanted = new Set(pendentesIds.map(Number));
+    const funcs = await selectTudo(() =>
+      sb()
+        .from('funcionarios')
+        .select('id, nome, matricula, ativo')
+        .in('id', [...idsWanted])
+        .order('id')
+    );
+    alvos = (funcs || []).filter((f) => f.ativo !== false);
+  } else {
+    const idsElegiveis = await carregarIdsElegiveisFolhaPmsl();
+    const funcs = await selectTudo(() =>
+      sb()
+        .from('funcionarios')
+        .select('id, nome, matricula, ativo')
+        .eq('ativo', true)
+        .order('id')
+    );
+    alvos = (funcs || []).filter((f) => idsElegiveis.has(f.id) && tokensLen(f.nome) >= 2);
+  }
+
+  // ———— índice da folha do range (o que já está gravado) ————
+  const folhaRange = await selectTudo(() =>
+    sb()
+      .from('folha_pmsl')
+      .select('matricula, funcionario, funcionario_norm, demissao, competencia')
+      .in('competencia', comps)
+      .order('competencia', { ascending: false })
+  );
+
+  const idxCompRefMat = new Set();
+  const idxCompRefNome = new Set();
+  const porMat = new Map();  // matKey → { competencia,demissao,funcionario } (mais recente vence)
+  const porNome = new Map(); // nomeNorm → idem
+  for (const f of folhaRange || []) {
+    const compF = Number(f.competencia);
+    const mk = f.matricula != null ? String(f.matricula).trim() : '';
+    const nn = f.funcionario_norm || normalizarNome(f.funcionario);
+    const row = {
+      competencia: compF,
+      demissao: f.demissao || null,
+      funcionario: f.funcionario,
+      matricula: f.matricula
+    };
+    if (compF === refN) {
+      if (mk) idxCompRefMat.add(mk);
+      if (nn) idxCompRefNome.add(nn);
+    }
+    if (mk) {
+      const prev = porMat.get(mk);
+      if (!prev || compF > prev.competencia || (row.demissao && !prev.demissao)) {
+        porMat.set(mk, row);
+      }
+    }
+    if (nn) {
+      const prev = porNome.get(nn);
+      if (!prev || compF > prev.competencia || (row.demissao && !prev.demissao)) {
+        porNome.set(nn, row);
+      }
+    }
+  }
+
+  const naFolhaCompRef = (hr) => {
+    const mk = !matriculaVazia(hr.matricula) ? String(hr.matricula).trim() : '';
+    if (mk && idxCompRefMat.has(mk)) return true;
+    const nn = normalizarNome(hr.nome);
+    return !!(nn && idxCompRefNome.has(nn));
+  };
+
+  const acharLocalPorHR = (hr, compFiltro = null) => {
+    const mk = !matriculaVazia(hr.matricula) ? String(hr.matricula).trim() : '';
+    if (mk) {
+      const h = porMat.get(mk);
+      if (h && (!compFiltro || h.competencia === compFiltro)) return h;
+    }
+    const nn = normalizarNome(hr.nome);
+    if (nn) {
+      const h = porNome.get(nn);
+      if (h && (!compFiltro || h.competencia === compFiltro)) return h;
+    }
+    return null;
+  };
+
+  const lerAposScrape = async (hr, compScrape) => {
+    const mk = !matriculaVazia(hr.matricula) ? String(hr.matricula).trim() : '';
+    if (mk) {
+      const { data } = await sb()
+        .from('folha_pmsl')
+        .select('matricula, funcionario, admissao, demissao, competencia, funcionario_norm')
+        .eq('matricula', mk)
+        .eq('competencia', Number(compScrape))
+        .limit(1);
+      if (data?.[0]) return data[0];
+    }
+    const nn = normalizarNome(hr.nome);
+    if (nn) {
+      const { data } = await sb()
+        .from('folha_pmsl')
+        .select('matricula, funcionario, admissao, demissao, competencia, funcionario_norm')
+        .eq('funcionario_norm', nn)
+        .eq('competencia', Number(compScrape))
+        .limit(1);
+      if (data?.[0]) return data[0];
+    }
+    return null;
+  };
+
+  // ————————————— itera —————————————
+  const stats = {
+    total: alvos.length,
+    processados: 0,
+    ativo_compref: 0,
+    candidato_exo: 0,
+    sumiu: 0,
+    sem_historico: 0,
+    scrapes: 0
+  };
+  const pendentesRestantes = [];
+
+  const emitir = async (hr, veredito) => {
+    stats.processados++;
+    stats[veredito.status] = (stats[veredito.status] || 0) + 1;
+    if (onResultado) {
+      try {
+        await onResultado({
+          funcionario_id: hr.id,
+          matricula: hr.matricula != null ? String(hr.matricula) : null,
+          nome: hr.nome,
+          ...veredito
+        });
+      } catch (e) {
+        console.warn('[aud] onResultado', hr.nome, e.message);
+      }
+    }
+    if (onProgress) {
+      try {
+        await onProgress({
+          processados: stats.processados,
+          total: stats.total,
+          pct: stats.total ? Math.round((stats.processados / stats.total) * 100) : 100,
+          scrapes: stats.scrapes,
+          etapa: veredito.status,
+          nome: hr.nome
+        });
+      } catch (_) { /* ok */ }
+    }
+  };
+
+  // Escopo === 'nao_identificados': só olha quem não está na folha de compRef.
+  // (escopo === 'todos_ativos' inclui os presentes como "ativo_compref" e sai.)
+  const emitirAtivoCompRef = escopo !== 'nao_identificados';
+
+  const parseWatchdog = Math.max(60000, Number(process.env.GIAP_SCRAPE_WATCHDOG_MS || 180000));
+
+  let scrapesNesteLote = 0;
+  for (let i = 0; i < alvos.length; i++) {
+    const hr = alvos[i];
+
+    // 1) Presente em compRef → ativo, sem scrape
+    if (naFolhaCompRef(hr)) {
+      if (emitirAtivoCompRef) {
+        await emitir(hr, {
+          status: 'ativo_compref',
+          competencia: refN,
+          demissao: null,
+          fonte: 'folha_compref'
+        });
+      } else {
+        stats.processados++;
+      }
+      continue;
+    }
+
+    // 2) Já tem aparição local em qualquer mês do range?
+    const localHit = acharLocalPorHR(hr);
+    if (localHit) {
+      await emitir(hr, {
+        status: localHit.demissao ? 'candidato_exo' : 'sumiu',
+        competencia: localHit.competencia,
+        demissao: localHit.demissao || null,
+        fonte: 'banco'
+      });
+      continue;
+    }
+
+    // 3) Faltante — scrape mês a mês (compRef-1 → compPiso)
+    if (tokensLen(hr.nome) < 2) {
+      await emitir(hr, {
+        status: 'sem_historico',
+        competencia: null,
+        demissao: null,
+        fonte: 'nome_curto'
+      });
+      continue;
+    }
+
+    // Corta o lote se já bateu limite (checkpoint)
+    if (loteMax > 0 && scrapesNesteLote >= loteMax) {
+      pendentesRestantes.push(...alvos.slice(i).map((a) => a.id));
+      break;
+    }
+
+    const busca = nomeBuscaGiap(hr.nome);
+    let acharado = null;
+    if (busca) {
+      for (const compScrape of compsAnteriores) {
+        try {
+          scrapesNesteLote++;
+          stats.scrapes++;
+          if (onProgress) {
+            try {
+              await onProgress({
+                processados: stats.processados,
+                total: stats.total,
+                pct: stats.total ? Math.round((stats.processados / stats.total) * 100) : 100,
+                scrapes: stats.scrapes,
+                etapa: `scrape_${compScrape}`,
+                nome: hr.nome
+              });
+            } catch (_) { /* ok */ }
+          }
+          await syncPorNome({
+            nomeServidor: busca,
+            codigoInstituicao: 1,
+            competencia: compScrape,
+            filtrarNomeAlvo: hr.nome,
+            apenasSemcas: false, // exonerado pode ter migrado antes; queremos qualquer aparição
+            maxVariantes: 1
+          });
+          const apos = await lerAposScrape(hr, compScrape);
+          if (apos) {
+            acharado = { ...apos, competencia: Number(apos.competencia) };
+            break;
+          }
+        } catch (err) {
+          console.warn('[aud] scrape', hr.nome, compScrape, err.message);
+          await pause(1500);
+        }
+        await pause(500);
+      }
+    }
+
+    if (acharado) {
+      await emitir(hr, {
+        status: acharado.demissao ? 'candidato_exo' : 'sumiu',
+        competencia: acharado.competencia,
+        demissao: acharado.demissao || null,
+        fonte: 'folha+api'
+      });
+    } else {
+      await emitir(hr, {
+        status: 'sem_historico',
+        competencia: null,
+        demissao: null,
+        fonte: 'sem_hit'
+      });
+    }
+  }
+
+  return {
+    comps,
+    stats,
+    pendentesIds: pendentesRestantes,
+    concluido: pendentesRestantes.length === 0
+  };
+}
+
 export { CODIGO_ORGAO_SEMCAS, getSupabase };
