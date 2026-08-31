@@ -41,6 +41,7 @@ app.get('/', (req, res) => {
       'GET  /health',
       'POST /debug/benchmark       {competencia?} — HTTP vs Puppeteer (não altera folha)',
       'POST /debug/investigar-request-url {competencia?, prefixos?} — P6_REQUEST_URL (não altera folha)',
+      'POST /debug/teste-apex-sequencial {n?, competencia?} — N consultas APEX reutilizadas',
       'POST /buscar',
       'POST /sync/orgao',
       'POST /sync/orgaos',
@@ -91,6 +92,20 @@ app.post('/debug/investigar-request-url', async (req, res) => {
     res.json(relatorio);
   } catch (e) {
     console.error('[/debug/investigar-request-url]', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/debug/teste-apex-sequencial', async (req, res) => {
+  try {
+    const n = Math.min(50, Math.max(1, Number(req.body.n || 10)));
+    const competencia = Number(req.body.competencia || competenciaAtual());
+    if (!validarCompetencia(competencia)) return res.status(400).json({ error: 'competencia inválida' });
+    const { executarTesteApexSequencialEFechar } = await import('./test-apex-sequencial.js');
+    const relatorio = await executarTesteApexSequencialEFechar({ n, competencia });
+    res.json(relatorio);
+  } catch (e) {
+    console.error('[/debug/teste-apex-sequencial]', e);
     res.status(500).json({ error: e.message });
   }
 });

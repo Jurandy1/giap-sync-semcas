@@ -21,8 +21,14 @@ services:
         value: "4"
       # Reusa o Chromium por várias buscas — corta o boot de ~8-15s por scrape.
       # Se voltar a OOMar, reduza para 1 (design de checkpoint garante retomada).
+      - key: GIAP_HTTP_DIRECT
+        value: "0"
+      - key: GIAP_SCRAPE_TIMEOUT_MS
+        value: "30000"
+      - key: GIAP_RESTART_BROWSER_AFTER_N
+        value: "20"
       - key: GIAP_BROWSER_RESTART_EVERY
-        value: "5"
+        value: "20"
       - key: GIAP_CLOSE_BROWSER_EVERY_NOME
         value: "5"
       - key: GIAP_BULK_META
