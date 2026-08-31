@@ -40,6 +40,16 @@ function matLiberada(matsOk, matricula) {
   return !!(k && matsOk.has(k));
 }
 
+/** Filtro bulk: SEMCAS ou matrícula liberada (cedidos/recebidos). */
+function filtrarBulkFolha(data, matsCedidos = []) {
+  const matsOk = new Set(
+    [...matsCedidos].map((m) => matKey(m)).filter(Boolean)
+  );
+  return data.filter(
+    (item) => ehFolhaSemcas(item) || matLiberada(matsOk, item.matricula)
+  );
+}
+
 /**
  * Converte item bruto do GIAP no formato da tabela folha_pmsl.
  */
@@ -148,6 +158,66 @@ export async function syncPorOrgao({ codigoOrgao, codigoInstituicao = 1, compete
           })
           .select('id');
 
+        if (error) throw error;
+        log.registros_inseridos = inseridos?.length || 0;
+      }
+    }
+
+    log.duracao_ms = Date.now() - inicio;
+    await logSync(log);
+    return { success: true, ...log };
+  } catch (e) {
+    log.erro = e.message;
+    log.duracao_ms = Date.now() - inicio;
+    await logSync(log);
+    throw e;
+  }
+}
+
+/**
+ * Varredura A–Z em bulk: 1 scrape por letra, filtra SEMCAS + cedidos/recebidos.
+ */
+export async function syncPorLetraBulk({
+  letra,
+  competencia,
+  codigoOrgao = CODIGO_ORGAO_SEMCAS,
+  matsCedidos = [],
+  codigoInstituicao = 1
+} = {}) {
+  const inicio = Date.now();
+  const log = {
+    tipo: 'letra_bulk',
+    parametros: { letra, competencia, codigoOrgao, mats_cedidos: matsCedidos.length },
+    registros_encontrados: 0,
+    registros_filtrados: 0,
+    registros_inseridos: 0
+  };
+
+  try {
+    const { data, requestUrl } = await scrapeRemuneracoes({
+      competencia,
+      codigoInstituicao,
+      nomeServidor: String(letra || '').trim().toUpperCase().slice(0, 1),
+      quantidade: 100
+    });
+
+    log.registros_encontrados = data.length;
+    log.parametros.request_url = requestUrl;
+
+    const filtradas = filtrarBulkFolha(data, matsCedidos);
+    log.registros_filtrados = filtradas.length;
+
+    if (filtradas.length > 0) {
+      const registros = dedupePorChave(
+        filtradas.map(transformar).filter((r) => r.matricula)
+      );
+      if (registros.length > 0) {
+        const { error, data: inseridos } = await sb()
+          .from('folha_pmsl')
+          .upsert(registros, {
+            onConflict: 'competencia,matricula,codigo_instituicao'
+          })
+          .select('id');
         if (error) throw error;
         log.registros_inseridos = inseridos?.length || 0;
       }
