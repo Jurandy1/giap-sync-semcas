@@ -2,6 +2,8 @@
  * Orquestração de jobs GIAP (sync órgão → enriquecer → exonerar).
  */
 import { syncPorOrgao, syncPorNome } from './sync.js';
+import { executarFaseBulk, contarFolhaBulk, GIAP_BULK_META } from './bulk.js';
+import { criarMetricas, memoriaPressionada } from './metrics.js';
 import {
   enriquecerFuncionarios,
   aplicarExoneracoes,
@@ -22,26 +24,18 @@ const MAX_VARIANTES_NOME = Math.max(1, Number(process.env.GIAP_MAX_VARIANTES_NOM
 /** Fecha o Chrome a cada N pessoas (libera RAM). */
 const CLOSE_BROWSER_EVERY_NOME = Math.max(
   1,
-  Number(process.env.GIAP_CLOSE_BROWSER_EVERY_NOME || 1)
+  Number(process.env.GIAP_CLOSE_BROWSER_EVERY_NOME || 5)
 );
 
 /** Encadeia lotes no servidor (continua com o navegador fechado). */
 const AUTO_CONTINUAR = process.env.GIAP_AUTO_CONTINUAR !== '0';
 const CONTINUAR_DELAY_MS = Math.max(
-  3000,
-  Number(process.env.GIAP_CONTINUAR_DELAY_MS || 10000)
+  2000,
+  Number(process.env.GIAP_CONTINUAR_DELAY_MS || 5000)
 );
 const MAX_CADEIA = Math.max(1, Number(process.env.GIAP_MAX_CONTINUACOES || 400));
 
-/** Varredura A–Z desligada por padrão — busca por nome completo é mais precisa.
- *  Reative com GIAP_SYNC_LETRAS=1 se precisar engordar a folha em massa. */
-const SYNC_LETRAS_ATIVO = process.env.GIAP_SYNC_LETRAS === '1';
-
-/** Se já tem muitos registros SEMCAS na folha, pula A–Z (só busca nomes faltantes). */
-const FOLHA_MIN_SKIP_LETRAS = Math.max(
-  50,
-  Number(process.env.GIAP_FOLHA_MIN_SKIP_LETRAS || 400)
-);
+const TIPOS_SYNC_FOLHA = ['sync_orgao', 'sync_folha', 'ciclo_completo'];
 
 /** Watchdog por scrape — acima disso considera pendurado e reseta o Chrome. */
 const SCRAPE_WATCHDOG_MS = Math.max(
@@ -127,6 +121,27 @@ export async function criarEExecutarJob({
     resetCadeiaContinua();
   }
 
+  // Evita dois jobs concorrentes na mesma competência (sync folha)
+  if (limparOrfaos !== false && modo !== 'continuar' && TIPOS_SYNC_FOLHA.includes(tipo)) {
+    const { data: ativo } = await sb()
+      .from('giap_jobs')
+      .select('*')
+      .eq('competencia', comp)
+      .in('tipo', TIPOS_SYNC_FOLHA)
+      .in('status', ['pending', 'running'])
+      .order('id', { ascending: false })
+      .limit(1);
+    if (ativo?.length) {
+      console.log(
+        '[jobs] job ativo para competência',
+        comp,
+        '— retorna existente #',
+        ativo[0].id
+      );
+      return ativo[0];
+    }
+  }
+
   // Jobs órfãos (Render OOM/restart) ficam "running" — cancela ao iniciar outro
   // (em lotes de continuação não limpa: o job anterior já está "done")
   if (limparOrfaos !== false) {
@@ -205,10 +220,11 @@ async function agendarProximoLote({
     return null;
   }
 
-  // Se o usuário (ou o cron) já disparou outro job, não empilha
+  // Se o usuário (ou o cron) já disparou outro job na mesma competência, não empilha
   const { count: ativos } = await sb()
     .from('giap_jobs')
     .select('id', { count: 'exact', head: true })
+    .eq('competencia', competencia)
     .in('status', ['pending', 'running']);
   if ((ativos || 0) > 0) {
     console.log('[jobs] continuação cancelada: já existe job ativo');
@@ -242,6 +258,7 @@ async function agendarProximoLote({
     filtros: {
       ...(filtros || {}),
       _cadeia: cadeia,
+      _total_inicial: filtros?._total_inicial,
       continuarAteCompletar: true,
       _job_anterior: jobAnteriorId
     }
@@ -451,123 +468,80 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao, filt
 
     // 1) Sync órgão (ciclo / sync_orgao / sync_folha = só grava buscas)
     if (tipo === 'ciclo_completo' || tipo === 'sync_orgao' || tipo === 'sync_folha') {
-      await setProgress(0, 0, 'sync_orgao');
+      const metricas = criarMetricas(jobId, competencia);
+      const cadeiaAtual = Number(filtros._cadeia || 0);
+      const isPrimeiroLote = cadeiaAtual === 0;
+      await setProgress(0, 0, isPrimeiroLote ? 'bulk_inicio' : 'sync_nomes');
 
-      // Se a folha da competência já tem gente, pula o scrape pesado do órgão
-      // (cada reopen do Chrome no free tier arrisca OOM).
       let folhaAntes = 0;
       try {
-        const { count } = await sb()
-          .from('folha_pmsl')
-          .select('id', { count: 'exact', head: true })
-          .eq('competencia', competencia)
-          .or(`lotacao.eq.SEMCAS,codigo_orgao.eq.${codigoOrgao}`);
-        folhaAntes = count || 0;
+        folhaAntes = await contarFolhaBulk(competencia, codigoOrgao);
       } catch {
         /* ignore */
       }
-
-      const pularOrgao =
-        process.env.GIAP_SKIP_ORGAO_SE_FOLHA === '0'
-          ? false
-          : folhaAntes >= Math.max(1, Number(process.env.GIAP_FOLHA_MIN_SKIP_ORGAO || 30));
 
       let syncRes = {
         success: true,
         registros_encontrados: 0,
         registros_filtrados: 0,
         registros_inseridos: 0,
-        pulou_orgao: pularOrgao,
+        pulou_orgao: true,
         folha_antes: folhaAntes
       };
-
-      if (!pularOrgao) {
-        syncRes = await comTimeout(
-          syncPorOrgao({
-            codigoOrgao: String(codigoOrgao),
-            codigoInstituicao: 1,
-            competencia
-          }),
-          SCRAPE_WATCHDOG_MS,
-          'sync_orgao'
-        ).catch(async (err) => {
-          await closeBrowser().catch(() => {});
-          throw err;
-        });
-        syncRes.pulou_orgao = false;
-        syncRes.folha_antes = folhaAntes;
-        // Libera Chrome antes das buscas por nome
-        await closeBrowser().catch(() => {});
-      } else {
-        await updateJob(jobId, {
-          progresso_pct: 15,
-          resumo: {
-            ...resumo,
-            etapa: `skip_orgao_folha_${folhaAntes}`
-          }
-        });
-      }
-
-      // GIAP limita a ~100 — completa com A–Z só se a folha ainda estiver magra
-      // Auditoria pode forçar letras (filtros.forcarLetras) sem ligar GIAP_SYNC_LETRAS no Render.
+      let bulkRes = null;
       let extras = 0;
       let letrasFeitas = 0;
-      let pulouLetras = false;
-      const forcarLetras = filtros?.forcarLetras === true;
-      const pularBuscasNome = filtros?.pularBuscasNome === true;
-      try {
-        const { count } = await sb()
-          .from('folha_pmsl')
-          .select('id', { count: 'exact', head: true })
-          .eq('competencia', competencia)
-          .or(`lotacao.eq.SEMCAS,codigo_orgao.eq.${codigoOrgao}`);
-        folhaAntes = count || 0;
-      } catch {
-        /* ignore */
-      }
+      let pulouLetras = true;
+      let pulouBulk = false;
 
-      if (!SYNC_LETRAS_ATIVO && !forcarLetras) {
-        pulouLetras = true;
+      // Fase bulk: órgão + A–Z somente no 1º lote e se folha < GIAP_BULK_META
+      if (isPrimeiroLote && folhaAntes < GIAP_BULK_META) {
         await updateJob(jobId, {
-          progresso_pct: 20,
-          resumo: { ...resumo, etapa: 'skip_letras_desativado' }
-        });
-      } else if (!forcarLetras && folhaAntes >= FOLHA_MIN_SKIP_LETRAS) {
-        pulouLetras = true;
-        await updateJob(jobId, {
-          progresso_pct: 20,
+          progresso_pct: 2,
           resumo: {
             ...resumo,
-            etapa: `skip_letras_folha_${folhaAntes}`
+            etapa: 'bulk_orgao',
+            bulk_meta: GIAP_BULK_META,
+            folha_antes: folhaAntes
           }
         });
-      } else {
-        const letras = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split('');
-        for (let i = 0; i < letras.length; i++) {
-          try {
-            const r = await comTimeout(
-              syncPorNome({
-                nomeServidor: letras[i],
-                codigoInstituicao: 1,
-                competencia,
-                filtrarOrgao: String(codigoOrgao)
-              }),
-              SCRAPE_WATCHDOG_MS,
-              `sync_letra_${letras[i]}`
-            );
-            extras += r.registros_inseridos || 0;
-            letrasFeitas++;
-          } catch (err) {
-            console.warn('[jobs] sync letra', letras[i], err.message);
-            if (String(err.message).startsWith('watchdog:')) {
-              await closeBrowser().catch(() => {});
-            }
+
+        bulkRes = await executarFaseBulk({
+          competencia,
+          codigoOrgao: String(codigoOrgao),
+          metricas,
+          comTimeout,
+          watchdogMs: SCRAPE_WATCHDOG_MS,
+          onProgress: async (p) => {
+            await updateJob(jobId, {
+              progresso_pct: Math.min(15, 2 + (p.letra_idx || 0)),
+              resumo: { ...resumo, etapa: p.etapa, bulk: p }
+            });
           }
-          await updateJob(jobId, {
-            progresso_pct: Math.round(5 + ((i + 1) / letras.length) * 12),
-            resumo: { ...resumo, etapa: `sync_letra_${letras[i]}` }
-          });
-        }
+        });
+
+        syncRes = {
+          success: true,
+          registros_encontrados: bulkRes.orgao?.registros_encontrados || 0,
+          registros_filtrados: bulkRes.orgao?.registros_filtrados || 0,
+          registros_inseridos: bulkRes.orgao?.registros_inseridos || 0,
+          pulou_orgao: false,
+          folha_antes: folhaAntes,
+          bulk: bulkRes
+        };
+        extras = bulkRes.letras?.inseridos || 0;
+        letrasFeitas = bulkRes.letras?.feitas || 0;
+        pulouLetras = false;
+        folhaAntes = bulkRes.folha_depois ?? folhaAntes;
+      } else {
+        pulouBulk = true;
+        const motivo = isPrimeiroLote
+          ? `folha_${folhaAntes}_gte_meta_${GIAP_BULK_META}`
+          : `continuacao_lote_${cadeiaAtual}`;
+        await updateJob(jobId, {
+          progresso_pct: 15,
+          resumo: { ...resumo, etapa: `skip_bulk_${motivo}`, folha_antes: folhaAntes }
+        });
       }
 
       // Mantém a mesma aba do Chrome para as buscas por nome (sem closeBrowser aqui)
@@ -582,6 +556,8 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao, filt
       let scrapesNome = 0;
       let buscasNome = [];
       let buscasPendentes = 0;
+      let totalPendentesInicial = 0;
+      const pularBuscasNome = filtros?.pularBuscasNome === true;
       verificadosNome = new Set();
       matriculasBusca = new Map();
       try {
@@ -591,6 +567,12 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao, filt
           buscasPendentes = 0;
         } else {
           let todas = await listarBuscasNomePendentes(competencia);
+          if (!filtros._total_inicial && todas.length) {
+            filtros._total_inicial = todas.length;
+          }
+          totalPendentesInicial = Number(filtros._total_inicial || todas.length);
+          metricas.setTotalServidores(totalPendentesInicial);
+          metricas.setPendentes(todas.length, true);
           // Sempre TODOS os elegíveis que ainda não estão na folha
           // (com/sem matrícula ou admissão — listarBuscasNomePendentes já exclui Terceirizado/PROCAD).
           todas.sort((a, b) => {
@@ -601,6 +583,9 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao, filt
           });
           buscasPendentes = Math.max(0, todas.length - MAX_BUSCAS_NOME);
           buscasNome = todas.slice(0, MAX_BUSCAS_NOME);
+          const lotesRestantes = Math.ceil(buscasPendentes / Math.max(1, MAX_BUSCAS_NOME));
+          metricas.setLote(cadeiaAtual + 1, lotesRestantes);
+          metricas.setPendentes(buscasPendentes);
         }
       } catch (err) {
         console.warn('[jobs] listar buscas nome', err.message);
@@ -612,6 +597,11 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao, filt
       } catch (_) { /* ok */ }
 
       for (let i = 0; i < buscasNome.length; i++) {
+        if (memoriaPressionada()) {
+          console.warn('[jobs] pressão de memória — fecha Chrome antes do nome', i + 1);
+          await closeBrowser().catch(() => {});
+        }
+
         const item = buscasNome[i];
         // Free tier: só 1ª variante (nome completo). Prefixo sobra p/ "Puxar na API".
         const variantesRaw = (item.variantes && item.variantes.length)
@@ -633,6 +623,7 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao, filt
           for (const busca of variantes) {
             scrapesNome++;
             ultimaBusca = busca;
+            const tNome = Date.now();
             const r = await comTimeout(
               syncPorNome({
                 nomeServidor: busca,
@@ -649,6 +640,8 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao, filt
               SCRAPE_WATCHDOG_MS,
               `sync_nome_${busca}`
             );
+            metricas.registrarScrape('nome', Date.now() - tNome);
+            metricas.registrarUpsert(r.registros_inseridos || 0);
             bruto = r.registros_encontrados || 0;
             posFiltro = r.registros_filtrados || 0;
             inseridos = r.registros_inseridos || 0;
@@ -698,6 +691,7 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao, filt
         } catch (err) {
           nomesVazios++;
           nomesScrapeVazio++;
+          metricas.registrarErro();
           console.warn('[jobs] sync nome', ultimaBusca || item.busca, err.message);
           if (String(err.message).startsWith('watchdog:')) {
             await closeBrowser().catch(() => {});
@@ -735,6 +729,16 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao, filt
       // Fecha Chrome antes do enriquecimento (só Node + Supabase)
       await closeBrowser();
 
+      const bulkRegistros =
+        (syncRes.registros_inseridos || 0) + extras;
+      const processadosTotal = Math.max(
+        0,
+        totalPendentesInicial - buscasPendentes
+      );
+      const lotesRestantesFim = Math.ceil(
+        buscasPendentes / Math.max(1, MAX_BUSCAS_NOME)
+      );
+
       resumo.sync = {
         orgao_bruto: syncRes.registros_encontrados,
         orgao_filtrado: syncRes.registros_filtrados,
@@ -745,10 +749,14 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao, filt
         extras_letras: extras,
         letras_feitas: letrasFeitas,
         pulou_letras: pulouLetras,
+        pulou_bulk: pulouBulk,
+        bulk_meta: GIAP_BULK_META,
+        bulk_registros: bulkRegistros,
         folha_antes: folhaAntes,
         extras_nomes: extrasNomes,
         buscas_nome: buscasNome.length,
         buscas_nome_pendentes: buscasPendentes,
+        total_pendentes_inicial: totalPendentesInicial,
         buscas_sem_matricula: buscasNome.filter((b) => !b.tem_matricula).length,
         buscas_com_matricula: buscasNome.filter((b) => b.tem_matricula).length,
         nomes_verificados: verificadosNome.size,
@@ -760,8 +768,20 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao, filt
         nomes_encontrados_reais: nomesEncontradosReais,
         scrapes_nome: scrapesNome,
         debug_nomes: debugNomes,
-        success: syncRes.success
+        success: syncRes.success,
+        bulk: bulkRes || undefined
       };
+      resumo.progresso = {
+        bulk_registros: bulkRegistros,
+        pendentes: buscasPendentes,
+        processados: processadosTotal,
+        total_servidores: totalPendentesInicial,
+        lote_atual: cadeiaAtual + 1,
+        lotes_restantes: lotesRestantesFim,
+        max_buscas_nome: MAX_BUSCAS_NOME
+      };
+      resumo.metricas = metricas.log('sync_folha_fim');
+      resumo.sincronizar_remuneracoes = buscasPendentes === 0;
       await updateJob(jobId, { progresso_pct: 30, resumo: { ...resumo, etapa: 'sync_ok' } });
       if (tipo === 'sync_orgao' || tipo === 'sync_folha') {
         // Só marca a competência como "buscada" quando não restam nomes pendentes
@@ -798,6 +818,9 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao, filt
             ...resumo,
             etapa: buscasPendentes > 0 ? 'done_parcial' : 'done',
             sync: resumo.sync,
+            progresso: resumo.progresso,
+            metricas: resumo.metricas,
+            sincronizar_remuneracoes: resumo.sincronizar_remuneracoes,
             continuara: buscasPendentes > 0 && AUTO_CONTINUAR && filtros?.continuarAteCompletar !== false
           }
         });
