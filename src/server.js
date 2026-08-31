@@ -40,6 +40,7 @@ app.get('/', (req, res) => {
     endpoints: [
       'GET  /health',
       'POST /debug/benchmark       {competencia?} — HTTP vs Puppeteer (não altera folha)',
+      'POST /debug/investigar-request-url {competencia?, prefixos?} — P6_REQUEST_URL (não altera folha)',
       'POST /buscar',
       'POST /sync/orgao',
       'POST /sync/orgaos',
@@ -72,6 +73,24 @@ app.post('/debug/benchmark', async (req, res) => {
     res.json(relatorio);
   } catch (e) {
     console.error('[/debug/benchmark]', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/debug/investigar-request-url', async (req, res) => {
+  try {
+    const competencia = Number(req.body.competencia || competenciaAtual());
+    if (!validarCompetencia(competencia)) return res.status(400).json({ error: 'competencia inválida' });
+    const prefixos = Array.isArray(req.body.prefixos) ? req.body.prefixos : undefined;
+    const { executarInvestigacaoRequestUrlEFechar } = await import('./investigar-request-url.js');
+    const relatorio = await executarInvestigacaoRequestUrlEFechar({
+      competencia,
+      prefixos,
+      timeoutMs: Number(req.body.timeoutMs || 120000)
+    });
+    res.json(relatorio);
+  } catch (e) {
+    console.error('[/debug/investigar-request-url]', e);
     res.status(500).json({ error: e.message });
   }
 });
