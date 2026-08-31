@@ -111,22 +111,72 @@ app.post('/debug/teste-apex-sequencial', async (req, res) => {
   }
 });
 
+const testeFolha50Runs = new Map();
+
 app.post('/debug/teste-folha-50', async (req, res) => {
   try {
     const competencia = Number(req.body.competencia || competenciaAtual());
     if (!validarCompetencia(competencia)) return res.status(400).json({ error: 'competencia inválida' });
-    const { executarTesteFolha50EFechar } = await import('./teste-folha-50.js');
-    const relatorio = await executarTesteFolha50EFechar({
+    const opts = {
       competencia,
       n: Math.min(50, Number(req.body.n || 50)),
       funcionario_ids: req.body.funcionario_ids,
       idempotencia: req.body.idempotencia !== false
+    };
+    const { executarTesteFolha50EFechar } = await import('./teste-folha-50.js');
+
+    // Render encerra HTTP ~15min; teste completo roda em background por padrão.
+    if (req.body.async === false) {
+      const relatorio = await executarTesteFolha50EFechar(opts);
+      return res.json(relatorio);
+    }
+
+    const runId = `tf50_${Date.now()}`;
+    testeFolha50Runs.set(runId, {
+      run_id: runId,
+      status: 'running',
+      started_at: new Date().toISOString(),
+      opts: { ...opts, funcionario_ids: opts.funcionario_ids?.length || undefined }
     });
-    res.json(relatorio);
+
+    res.status(202).json({
+      run_id: runId,
+      status: 'running',
+      poll: `/debug/teste-folha-50/${runId}`,
+      message: 'Teste iniciado em background. Faça GET no poll até status=done.'
+    });
+
+    (async () => {
+      try {
+        const relatorio = await executarTesteFolha50EFechar(opts);
+        testeFolha50Runs.set(runId, {
+          run_id: runId,
+          status: 'done',
+          started_at: testeFolha50Runs.get(runId)?.started_at,
+          finished_at: new Date().toISOString(),
+          relatorio
+        });
+      } catch (e) {
+        console.error(`[/debug/teste-folha-50 ${runId}]`, e);
+        testeFolha50Runs.set(runId, {
+          run_id: runId,
+          status: 'error',
+          started_at: testeFolha50Runs.get(runId)?.started_at,
+          finished_at: new Date().toISOString(),
+          error: e.message
+        });
+      }
+    })();
   } catch (e) {
     console.error('[/debug/teste-folha-50]', e);
     res.status(500).json({ error: e.message });
   }
+});
+
+app.get('/debug/teste-folha-50/:runId', (req, res) => {
+  const run = testeFolha50Runs.get(req.params.runId);
+  if (!run) return res.status(404).json({ error: 'run não encontrado (expirou ou serviço reiniciou)' });
+  res.json(run);
 });
 
 // Busca ao vivo (não persiste no Supabase)
