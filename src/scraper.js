@@ -2,6 +2,8 @@ import puppeteer from 'puppeteer';
 import fs from 'fs';
 import path from 'path';
 import { normalizarRespostaLista, inspecionarShapeResposta } from './utils.js';
+import { buildRemuneracoesUrl } from './giap-http.js';
+import { atualizarSessao, tentarHttpComSessao, limparSessao } from './scraper-session.js';
 
 const PORTAL_URL = 'https://saoluis.giap.com.br/ords/saoluis/f?p=1618:6';
 
@@ -39,6 +41,40 @@ const BROWSER_RESTART_EVERY = Math.max(
 );
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function criarTiming() {
+  return {
+    tempo_criar_browser: 0,
+    tempo_abrir_pagina: 0,
+    tempo_carregar_apex: 0,
+    tempo_preencher_campos: 0,
+    tempo_executar_ajax: 0,
+    tempo_esperar_resultado: 0,
+    tempo_extrair_resultado: 0,
+    tempo_http: 0,
+    tempo_total: 0,
+    pagina_reutilizada: false,
+    browser_novo: false,
+    metodo: 'puppeteer_apex'
+  };
+}
+
+function logTimingScrape(nome, timing, extra = {}) {
+  console.log(
+    JSON.stringify({
+      evento: 'giap_scrape_timing',
+      nome: nome || null,
+      ...timing,
+      memoria_mb: Math.round(process.memoryUsage().rss / 1024 / 1024),
+      scrapes_desde_restart: scrapesDesdeRestart,
+      ...extra
+    })
+  );
+}
+
+function msSince(t0) {
+  return Date.now() - t0;
+}
 
 function ehErroFrameCedo(err) {
   const msg = String(err?.message || err || '');
@@ -157,6 +193,7 @@ export async function closeBrowser() {
     browserInstance = null;
   }
   scrapesDesdeRestart = 0;
+  limparSessao();
   if (typeof global.gc === 'function') {
     try {
       global.gc();
@@ -166,7 +203,7 @@ export async function closeBrowser() {
   }
 }
 
-async function getBrowser() {
+async function getBrowser(timing = null) {
   if (scrapesDesdeRestart >= BROWSER_RESTART_EVERY) {
     console.log('[puppeteer] reiniciando browser (RAM) após', scrapesDesdeRestart, 'consultas');
     await closeBrowser();
@@ -175,6 +212,10 @@ async function getBrowser() {
   if (browserInstance) {
     try {
       await browserInstance.version();
+      if (timing) {
+        timing.tempo_criar_browser = 0;
+        timing.browser_novo = false;
+      }
       return browserInstance;
     } catch {
       browserInstance = null;
@@ -182,9 +223,11 @@ async function getBrowser() {
     }
   }
 
+  const tLaunch = Date.now();
   const executablePath = resolverExecutablePath();
   const launchOpts = {
     headless: 'new',
+    protocolTimeout: Math.max(120000, Number(process.env.GIAP_PROTOCOL_TIMEOUT_MS || 180000)),
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
@@ -220,6 +263,10 @@ async function getBrowser() {
   try {
     browserInstance = await puppeteer.launch(launchOpts);
     scrapesDesdeRestart = 0;
+    if (timing) {
+      timing.tempo_criar_browser = msSince(tLaunch);
+      timing.browser_novo = true;
+    }
   } catch (e) {
     const msg = e?.message || String(e);
     if (msg.includes('Could not find Chrome') || msg.includes('Browser was not found')) {
@@ -235,8 +282,9 @@ async function getBrowser() {
   return browserInstance;
 }
 
-/** Bloqueia imagem/fonte/mídia pra caber em 512MB. */
+/** Bloqueia recursos pesados — listener registrado uma vez por página. */
 async function prepararPaginaLeve(page) {
+  if (page._giapInterceptionReady) return;
   await page.setRequestInterception(true);
   page.on('request', (req) => {
     const tipo = req.resourceType();
@@ -246,6 +294,7 @@ async function prepararPaginaLeve(page) {
       req.continue().catch(() => {});
     }
   });
+  page._giapInterceptionReady = true;
 }
 
 async function loadPortal(page, timeoutMs) {
@@ -285,8 +334,8 @@ async function expandirAccordionRem(page) {
 }
 
 /** Uma página viva do portal — reutilizada entre consultas. */
-async function getRemPage(timeoutMs) {
-  const browser = await getBrowser();
+async function getRemPage(timeoutMs, timing = null) {
+  const browser = await getBrowser(timing);
 
   if (remPage) {
     try {
@@ -296,20 +345,36 @@ async function getRemPage(timeoutMs) {
         const ok = await remPage.evaluate(
           () => !!(window.apex && window.apex.item && window.apex.item('P6_COMPETENCIA'))
         );
-        if (ok) return remPage;
+        if (ok) {
+          if (timing) timing.pagina_reutilizada = true;
+          try {
+            const cookies = await remPage.cookies();
+            atualizarSessao(cookies);
+          } catch {
+            /* ok */
+          }
+          return remPage;
+        }
       }
     } catch {
       remPage = null;
     }
   }
 
+  const tPage = Date.now();
   const page = await browser.newPage();
-  await sleep(500); // race comum no Render: newPage → goto cedo demais
+  if (timing) timing.tempo_abrir_pagina = msSince(tPage);
+
+  await sleep(500);
   await page.setDefaultTimeout(timeoutMs);
   await prepararPaginaLeve(page);
+  const tApex = Date.now();
   try {
     await loadPortal(page, timeoutMs);
     await expandirAccordionRem(page);
+    if (timing) timing.tempo_carregar_apex = msSince(tApex);
+    const cookies = await page.cookies();
+    atualizarSessao(cookies);
   } catch (e) {
     await page.close().catch(() => {});
     throw e;
@@ -326,17 +391,50 @@ async function scrapeRemuneracoesOnce({
   quantidade = 100,
   timeoutMs = 60000
 } = {}) {
+  const tTotal = Date.now();
+  const timing = criarTiming();
   const nomeRaw = nomeServidor != null ? String(nomeServidor).trim() : '';
   const nome = nomeRaw.toUpperCase();
   const orgRaw = codigoOrgao != null && codigoOrgao !== '' ? String(codigoOrgao).trim() : '';
-  // Portal: codigo_orgao só funciona COM nome (prefixo). Sem nome → resposta vazia.
   const enviarOrgao = !!(orgRaw && nome);
 
-  const page = await getRemPage(timeoutMs);
+  // Caminho A: HTTP direto com cookies da sessão APEX (sem navegar/clicar)
+  const tHttp = Date.now();
+  const httpHit = await tentarHttpComSessao({
+    competencia,
+    codigoInstituicao,
+    codigoOrgao: enviarOrgao ? orgRaw : '',
+    nomeServidor: nome,
+    quantidade
+  });
+  timing.tempo_http = msSince(tHttp);
+  if (httpHit) {
+    timing.metodo = 'http_sessao';
+    timing.tempo_total = msSince(tTotal);
+    logTimingScrape(nome, timing, {
+      count: httpHit.count,
+      status: httpHit.status,
+      url: httpHit.url
+    });
+    return {
+      data: httpHit.data,
+      responseMeta: httpHit.responseMeta,
+      requestUrl: httpHit.url,
+      raw: '',
+      codigo_orgao_enviado: enviarOrgao ? orgRaw : null,
+      timing,
+      metodo: 'http_sessao'
+    };
+  }
+
+  // Caminho B: APEX — preenche itens, clica Executa, lê textarea (NATIVE_EXECUTE_PLSQL_CODE)
+  timing.metodo = 'puppeteer_apex';
+  const page = await getRemPage(timeoutMs, timing);
   scrapesDesdeRestart++;
 
   const token = `giap_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 
+  const tFill = Date.now();
   await page.evaluate(
     (ids, params, token) => {
       apex.item(ids.competencia).setValue(String(params.competencia));
@@ -365,12 +463,16 @@ async function scrapeRemuneracoesOnce({
     },
     token
   );
+  timing.tempo_preencher_campos = msSince(tFill);
 
+  const tClick = Date.now();
   await page.$eval(IDS.botaoExecutaRem, (el) => {
     el.scrollIntoView({ block: 'center', inline: 'center' });
     el.click();
   });
+  timing.tempo_executar_ajax = msSince(tClick);
 
+  const tWait = Date.now();
   try {
     await page.waitForFunction(
       (id, token) => {
@@ -383,10 +485,15 @@ async function scrapeRemuneracoesOnce({
       token
     );
   } catch (err) {
+    timing.tempo_esperar_resultado = msSince(tWait);
+    timing.tempo_total = msSince(tTotal);
+    logTimingScrape(nome, timing, { erro: err.message, timeout: true });
     console.warn('[scraper] timeout remuneracoes', nomeServidor || codigoOrgao || '', err.message);
-    return { data: [], requestUrl: null, raw: '' };
+    return { data: [], requestUrl: null, raw: '', timing, metodo: 'puppeteer_apex' };
   }
+  timing.tempo_esperar_resultado = msSince(tWait);
 
+  const tExtract = Date.now();
   const { raw, requestUrl } = await page.evaluate(
     (ids) => ({
       raw: apex.item(ids.resultadoRem).getValue(),
@@ -394,14 +501,35 @@ async function scrapeRemuneracoesOnce({
     }),
     IDS
   );
+  try {
+    atualizarSessao(await page.cookies());
+  } catch {
+    /* ok */
+  }
+  timing.tempo_extrair_resultado = msSince(tExtract);
 
   const parsed = parseResult(raw, { requestUrl });
+  timing.tempo_total = msSince(tTotal);
+  logTimingScrape(nome, timing, {
+    count: parsed.lista?.length || 0,
+    request_url: requestUrl,
+    ords_url_esperada: buildRemuneracoesUrl({
+      competencia,
+      codigoInstituicao,
+      codigoOrgao: enviarOrgao ? orgRaw : '',
+      nomeServidor: nome,
+      quantidade
+    })
+  });
+
   return {
     data: parsed.lista,
     responseMeta: parsed.meta,
     requestUrl,
     raw,
-    codigo_orgao_enviado: enviarOrgao ? orgRaw : null
+    codigo_orgao_enviado: enviarOrgao ? orgRaw : null,
+    timing,
+    metodo: 'puppeteer_apex'
   };
 }
 

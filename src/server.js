@@ -39,6 +39,7 @@ app.get('/', (req, res) => {
     version: '1.1.0',
     endpoints: [
       'GET  /health',
+      'POST /debug/benchmark       {competencia?} — HTTP vs Puppeteer (não altera folha)',
       'POST /buscar',
       'POST /sync/orgao',
       'POST /sync/orgaos',
@@ -57,6 +58,86 @@ app.get('/', (req, res) => {
 
 app.get('/health', (req, res) => {
   res.json({ ok: true, ts: new Date().toISOString() });
+});
+
+app.post('/debug/benchmark', async (req, res) => {
+  try {
+    const competencia = Number(req.body.competencia || competenciaAtual());
+    if (!validarCompetencia(competencia)) return res.status(400).json({ error: 'competencia inválida' });
+    const { fetchRemuneracoesHttp, buildRemuneracoesUrl } = await import('./giap-http.js');
+    const { getSessionCookies } = await import('./scraper-session.js');
+    const ORG = process.env.GIAP_CODIGO_ORGAO || '9';
+    const prefixos = ['TERESINHA', 'MARIA', 'ANA'];
+    const fases = {};
+
+    fases.http_sem_sessao = await fetchRemuneracoesHttp({
+      competencia,
+      codigoInstituicao: 1,
+      codigoOrgao: ORG,
+      nomeServidor: 'TERESINHA',
+      quantidade: 100
+    });
+
+    const boot = await scrapeRemuneracoes({
+      competencia,
+      codigoInstituicao: 1,
+      codigoOrgao: ORG,
+      nomeServidor: 'TERESINHA',
+      quantidade: 100,
+      timeoutMs: 120000
+    });
+    fases.bootstrap = {
+      metodo: boot.metodo,
+      count: boot.data?.length,
+      timing: boot.timing,
+      cookies: getSessionCookies()?.length || 0
+    };
+
+    fases.http_com_sessao = {};
+    for (const p of prefixos) {
+      fases.http_com_sessao[p] = await fetchRemuneracoesHttp({
+        competencia,
+        codigoInstituicao: 1,
+        codigoOrgao: ORG,
+        nomeServidor: p,
+        quantidade: 100,
+        cookies: getSessionCookies()
+      });
+    }
+
+    fases.scrape_pos_sessao = {};
+    for (const p of ['MARIA', 'ANA']) {
+      const r = await scrapeRemuneracoes({
+        competencia,
+        codigoInstituicao: 1,
+        codigoOrgao: ORG,
+        nomeServidor: p,
+        quantidade: 100,
+        timeoutMs: 120000
+      });
+      fases.scrape_pos_sessao[p] = {
+        metodo: r.metodo,
+        count: r.data?.length,
+        timing: r.timing
+      };
+    }
+
+    res.json({
+      competencia,
+      endpoint: buildRemuneracoesUrl({
+        competencia,
+        codigoInstituicao: 1,
+        codigoOrgao: ORG,
+        nomeServidor: 'TERESINHA',
+        quantidade: 100
+      }),
+      fases,
+      memoria_mb: Math.round(process.memoryUsage().rss / 1024 / 1024)
+    });
+  } catch (e) {
+    console.error('[/debug/benchmark]', e);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // Busca ao vivo (não persiste no Supabase)
