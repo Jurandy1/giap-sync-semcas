@@ -2,7 +2,7 @@
  * Fase bulk: órgão + prefixos dos pendentes (+ A–Z opcional).
  * Indexa brutos para matching local; não altera cadastro RH.
  */
-import { syncPorOrgao, syncPorPrefixoBulk, transformar, upsertRegistrosFolha } from './sync.js';
+import { syncPorPrefixoBulk, transformar, upsertRegistrosFolha } from './sync.js';
 import { carregarCedenciasAtuais } from './rhsemcas.js';
 import { getSupabase } from './supabase.js';
 import { closeBrowser } from './scraper.js';
@@ -165,81 +165,36 @@ export async function executarFaseBulk({
 
   let restantes = [...pendentes];
 
-  // 1) Órgão — indexa bruto completo (sem filtrar antes do matching)
-  if (onProgress) await onProgress({ etapa: 'bulk_orgao', folha_antes: folhaAntes });
-  const t0 = Date.now();
-  try {
-    resultado.orgao = await runTimed(
-      () =>
-        syncPorOrgao({
-          codigoOrgao: String(codigoOrgao),
-          codigoInstituicao: 1,
-          competencia,
-          modo: 'indexar'
-        }),
-      'bulk_sync_orgao'
-    );
-
-    const bruto = Array.isArray(resultado.orgao?.data_bruta) ? resultado.orgao.data_bruta : [];
-    const medOrgao = medirBrutoOrgao(bruto, matsSet);
-    Object.assign(stats, medOrgao);
-    stats.registros_giap += bruto.length;
-    stats.bulk_bruto += bruto.length;
-
-    indice.addItems(bruto, 'orgao');
-    stats.registros_indexados = indice.size;
-
-    metricas?.registrarScrape('orgao', Date.now() - t0);
-    stats.tempo_orgao_ms = Date.now() - t0;
-
-    console.log(
-      JSON.stringify({
-        evento: 'giap_bulk_orgao',
-        competencia,
-        request_url: resultado.orgao?.request_url,
-        response_shape: resultado.orgao?.response_shape,
-        ...medOrgao,
-        registros_indexados: indice.size
-      })
-    );
-
-    restantes = await aplicarCruzamento(
-      restantes,
-      indice,
-      matsSet,
-      cedencias,
-      competencia,
-      stats,
-      resultado,
-      { orgao: true }
-    );
-  } catch (e) {
-    metricas?.registrarErro();
-    resultado.orgao = {
-      erro: e.message,
-      success: false,
-      response_meta: e.response_meta || null
-    };
-    console.warn('[bulk] sync orgao falhou:', e.message);
-    await closeBrowser().catch(() => {});
-  }
+  // Bulk = prefixos + codigo_orgao=9 (consulta global sem nome retorna vazio no portal)
+  resultado.orgao = {
+    pulou: true,
+    motivo: 'bulk_e_prefixos_com_orgao_9_sem_nome_vazio_no_portal'
+  };
 
   stats.bulk_util = indice.size;
 
-  // 2) Prefixos derivados dos pendentes (padrão — mais eficiente que A–Z)
-  const prefixos =
-    restantes.length >= MIN_PENDENTES_BULK_EXTRA
-      ? prefixosGlobaisDedup(restantes)
-      : [];
+  // Prefixos derivados do histórico / pendentes — cada um com codigo_orgao=9
+  const prefixos = restantes.length > 0 ? prefixosGlobaisDedup(restantes) : [];
+  stats.prefixos_unicos = prefixos.length;
+  stats.consultas_giap_prefixo = 0;
 
   for (const prefixo of prefixos) {
     if (memoriaPressionada()) await closeBrowser().catch(() => {});
 
     if (onProgress) await onProgress({ etapa: `bulk_prefixo`, prefixo });
 
-    const t1 = Date.now();
-    const detalhe = { prefixo, bruto: 0, filtrados: 0, descartados: 0, inseridos: 0, matches_local: 0 };
+    const detalhe = {
+      prefixo,
+      codigo_orgao: String(codigoOrgao),
+      bruto: 0,
+      semcas: 0,
+      outros_orgaos: 0,
+      inseridos: 0,
+      matches_local: 0,
+      tempo_ms: 0
+    };
     try {
+      const t1 = Date.now();
       const r = await runTimed(
         () =>
           syncPorPrefixoBulk({
@@ -251,12 +206,15 @@ export async function executarFaseBulk({
           }),
         `bulk_prefixo_${prefixo}`
       );
+      detalhe.tempo_ms = Date.now() - t1;
+      stats.consultas_giap_prefixo++;
       const bruto = Array.isArray(r.data_bruta) ? r.data_bruta : [];
+      const med = medirBrutoOrgao(bruto, matsSet);
       detalhe.bruto = bruto.length;
-      detalhe.registros_giap = r.registros_giap || bruto.length;
-      detalhe.filtrados = r.registros_filtrados || 0;
-      detalhe.descartados = r.registros_descartados || 0;
-      detalhe.inseridos_direto = r.registros_inseridos || 0;
+      detalhe.semcas = med.orgao_SEMCAS;
+      detalhe.outros_orgaos = med.orgao_outros;
+      detalhe.codigo_orgao_enviado = r.codigo_orgao_enviado;
+      detalhe.request_url = r.parametros?.request_url;
       indice.addItems(bruto, `prefixo:${prefixo}`);
       stats.registros_giap += bruto.length;
       stats.bulk_bruto += bruto.length;

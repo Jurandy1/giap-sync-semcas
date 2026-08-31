@@ -14,7 +14,8 @@ import {
   registrarEstrategia,
   resumoEstrategias,
   CLASSIFICACAO,
-  matKey
+  matKey,
+  codigoOrgaoParaBusca
 } from './matching.js';
 import { normalizarRespostaLista } from './utils.js';
 import {
@@ -31,6 +32,7 @@ export async function processarPendentesInteligente({
   cache = null,
   indiceHistorico = null,
   cedencias = { ids: new Set(), mats: new Set() },
+  codigoOrgao = process.env.GIAP_CODIGO_ORGAO || '9',
   maxBuscas = 3,
   comTimeout = null,
   watchdogMs = 180000,
@@ -112,6 +114,7 @@ export async function processarPendentesInteligente({
 
     const usaHistorico = historicoEhConfiavel(pendente.historico);
     const estrategias = estrategiasComHistorico(pendente, pendente.historico);
+    const codigoOrgaoBusca = codigoOrgaoParaBusca(pendente, codigoOrgao);
 
     // Reutiliza índice bulk/histórico antes de chamar GIAP
     const localPre = matchPendenteNoIndice(pendente, indice, {
@@ -160,7 +163,8 @@ export async function processarPendentesInteligente({
     for (const estrategia of estrategias) {
       stats.tentativas_nome++;
       ultimaBusca = estrategia;
-      const cacheHit = jobCache.get(estrategia);
+      const cacheKey = `${estrategia}|org:${codigoOrgaoBusca || 'none'}`;
+      const cacheHit = jobCache.get(cacheKey);
       let data;
       let duracaoMs = 0;
 
@@ -183,16 +187,17 @@ export async function processarPendentesInteligente({
               scrapeRemuneracoes({
                 competencia,
                 codigoInstituicao: 1,
+                codigoOrgao: codigoOrgaoBusca,
                 nomeServidor: estrategia,
                 quantidade: 100
               }),
-            `sync_nome_${estrategia}`
+            `sync_nome_${estrategia}_org${codigoOrgaoBusca || '0'}`
           );
           const norm = normalizarRespostaLista(r.data, { requestUrl: r.requestUrl, rawPrefix: r.raw });
           if (norm.erro) throw new Error(norm.erro);
           data = norm.lista;
           duracaoMs = Date.now() - t1;
-          jobCache.set(estrategia, { data, duracao_ms: duracaoMs });
+          jobCache.set(cacheKey, { data, duracao_ms: duracaoMs });
           scrapesNome++;
           stats.buscas_nome++;
           metricas?.registrarScrape('nome', duracaoMs);

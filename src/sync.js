@@ -245,10 +245,11 @@ export async function syncPorPrefixoBulk({
   };
 
   try {
-    const { data, requestUrl, responseMeta, raw } = await scrapeRemuneracoes({
+    const { data, requestUrl, responseMeta, raw, codigo_orgao_enviado } = await scrapeRemuneracoes({
       competencia,
       codigoInstituicao,
       nomeServidor: termo,
+      codigoOrgao: codigoOrgao,
       quantidade: 100
     });
 
@@ -258,6 +259,7 @@ export async function syncPorPrefixoBulk({
     log.registros_giap = lista.length;
     log.registros_encontrados = lista.length;
     log.parametros.request_url = requestUrl;
+    log.parametros.codigo_orgao_enviado = codigo_orgao_enviado;
     log.response_shape = meta?.shape;
 
     if (modo === 'indexar') {
@@ -268,12 +270,14 @@ export async function syncPorPrefixoBulk({
         modo: 'indexar',
         data_bruta: lista,
         registros_giap: lista.length,
+        codigo_orgao_enviado,
         response_meta: meta,
         ...log
       };
     }
 
-    const filtradas = filtrarBulkFolha(lista, matsCedidos);
+    // API já filtrou por órgão quando codigo_orgao_enviado — não refiltrar SEMCAS
+    const filtradas = codigo_orgao_enviado ? lista : filtrarBulkFolha(lista, matsCedidos);
     log.registros_filtrados = filtradas.length;
     log.registros_descartados = lista.length - filtradas.length;
 
@@ -289,7 +293,14 @@ export async function syncPorPrefixoBulk({
 
     log.duracao_ms = Date.now() - inicio;
     await logSync(log);
-    return { success: true, data_bruta: lista, registros_giap: lista.length, response_meta: meta, ...log };
+    return {
+      success: true,
+      data_bruta: lista,
+      registros_giap: lista.length,
+      codigo_orgao_enviado,
+      response_meta: meta,
+      ...log
+    };
   } catch (e) {
     log.erro = e.message;
     log.duracao_ms = Date.now() - inicio;
@@ -379,11 +390,14 @@ export async function syncPorNome({
     let data = [];
     let requestUrl = null;
     let raw = '';
+    const orgGiap =
+      matsOk?.size && !apenasSemcas ? '' : orgaoFiltro || CODIGO_ORGAO_SEMCAS;
     for (const busca of variantes.slice(0, maxVar)) {
       buscaUsada = busca;
       const r = await scrapeRemuneracoes({
         competencia,
         codigoInstituicao,
+        codigoOrgao: orgGiap,
         nomeServidor: busca,
         quantidade: qtd
       });

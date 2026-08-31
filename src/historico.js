@@ -158,14 +158,13 @@ export function estrategiasComHistorico(pendente, historico) {
   };
 
   if (historico?.funcionario) {
-    add(historico.funcionario);
-    add(normalizarNome(historico.funcionario));
+    const sig = tokensSignificativos(historico.funcionario);
+    if (sig[0]) add(sig[0]);
+    if (sig.length >= 2) add([sig[0], sig[1]].join(' '));
+    if (sig.length >= 3) add(sig.slice(0, 3).join(' '));
   }
 
   if (historicoEhConfiavel(historico)) {
-    // Âncora histórica: no máx. 1 fallback curto (primeiro+último do nome GIAP)
-    const sig = tokensSignificativos(historico.funcionario || pendente.nome);
-    if (sig.length >= 2) add([sig[0], sig[sig.length - 1]].join(' '));
     return out.slice(0, 2);
   }
 

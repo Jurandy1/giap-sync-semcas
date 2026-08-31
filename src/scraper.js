@@ -326,12 +326,11 @@ async function scrapeRemuneracoesOnce({
   quantidade = 100,
   timeoutMs = 60000
 } = {}) {
-  if (codigoOrgao !== '' && codigoOrgao != null) {
-    console.warn(
-      '[scraper] codigoOrgao ignorado no portal (retornaria vazio). Filtre pós-scrape. Recebido:',
-      codigoOrgao
-    );
-  }
+  const nomeRaw = nomeServidor != null ? String(nomeServidor).trim() : '';
+  const nome = nomeRaw.toUpperCase();
+  const orgRaw = codigoOrgao != null && codigoOrgao !== '' ? String(codigoOrgao).trim() : '';
+  // Portal: codigo_orgao só funciona COM nome (prefixo). Sem nome → resposta vazia.
+  const enviarOrgao = !!(orgRaw && nome);
 
   const page = await getRemPage(timeoutMs);
   scrapesDesdeRestart++;
@@ -342,9 +341,12 @@ async function scrapeRemuneracoesOnce({
     (ids, params, token) => {
       apex.item(ids.competencia).setValue(String(params.competencia));
       apex.item(ids.codigoInstituicao).setValue(String(params.codigoInstituicao));
-      apex.item(ids.codigoOrgao).setValue('', null, true);
+      if (params.enviarOrgao) {
+        apex.item(ids.codigoOrgao).setValue(String(params.codigoOrgao), null, true);
+      } else {
+        apex.item(ids.codigoOrgao).setValue('', null, true);
+      }
       const nomeRaw = params.nomeServidor != null ? String(params.nomeServidor).trim() : '';
-      // Portal indexa em MAIÚSCULAS — minúsculas do RH costumam retornar vazio
       const nome = nomeRaw.toUpperCase();
       apex.item(ids.nomeServidor).setValue('', null, true);
       apex.item(ids.nomeServidor).setValue(nome, null, true);
@@ -353,7 +355,14 @@ async function scrapeRemuneracoesOnce({
       apex.item(ids.requestUrlRem).setValue('');
     },
     IDS,
-    { competencia, codigoInstituicao, nomeServidor, quantidade },
+    {
+      competencia,
+      codigoInstituicao,
+      nomeServidor: nome,
+      codigoOrgao: orgRaw,
+      enviarOrgao,
+      quantidade
+    },
     token
   );
 
@@ -387,7 +396,13 @@ async function scrapeRemuneracoesOnce({
   );
 
   const parsed = parseResult(raw, { requestUrl });
-  return { data: parsed.lista, responseMeta: parsed.meta, requestUrl, raw };
+  return {
+    data: parsed.lista,
+    responseMeta: parsed.meta,
+    requestUrl,
+    raw,
+    codigo_orgao_enviado: enviarOrgao ? orgRaw : null
+  };
 }
 
 /**

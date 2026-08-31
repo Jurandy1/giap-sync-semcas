@@ -95,30 +95,39 @@ export function estrategiasBuscaProgressiva(nome, max = null) {
   return out.slice(0, limite);
 }
 
-/** Prefixos globais deduplicados — 1 consulta GIAP por prefixo único, prioriza cobertura. */
+/** Prefixos globais deduplicados — 1 consulta GIAP por prefixo, prioriza 1º token do nome GIAP histórico. */
 export function prefixosGlobaisDedup(pendentes, max = null) {
   const lim = max ?? Math.max(5, Number(process.env.GIAP_BULK_PREFIXOS_MAX || 15));
   const freq = new Map();
 
-  const add = (prefix) => {
+  const add = (prefix, peso = 1) => {
     const v = String(prefix || '').trim().toUpperCase();
-    if (v.length >= 3) freq.set(v, (freq.get(v) || 0) + 1);
+    if (v.length >= 3) freq.set(v, (freq.get(v) || 0) + peso);
   };
 
   for (const p of pendentes || []) {
     const nomeBase = p.historico?.funcionario || p.nome;
     const sig = tokensSignificativos(nomeBase);
-    if (sig.length >= 2) {
-      add([sig[0], sig[1]].join(' '));
-      add([sig[0], sig[sig.length - 1]].join(' '));
-      if (sig.length >= 3) add(sig.slice(0, 3).join(' '));
-    }
+    if (!sig.length) continue;
+    add(sig[0], 3);
+    if (sig.length >= 2) add([sig[0], sig[1]].join(' '), 2);
+    if (sig.length >= 3) add(sig.slice(0, 3).join(' '), 1);
   }
 
   return [...freq.entries()]
-    .sort((a, b) => b[1] - a[1] || b[0].length - a[0].length)
+    .sort((a, b) => b[1] - a[1] || a[0].length - b[0].length)
     .map(([prefix]) => prefix)
     .slice(0, lim);
+}
+
+/** codigo_orgao para busca GIAP: SEMCAS=9; cedidos/recebidos sem restrição cega. */
+export function codigoOrgaoParaBusca(pendente, codigoSemcas = CODIGO_ORGAO_SEMCAS) {
+  const ehCedido = pendente?.eh_cedido || pendente?.grupo_historico === 'D';
+  if (ehCedido) {
+    const orgHist = pendente?.historico?.codigo_orgao;
+    return orgHist != null && orgHist !== '' ? String(orgHist) : '';
+  }
+  return String(codigoSemcas);
 }
 
 /** @deprecated alias — use prefixosGlobaisDedup */
@@ -619,7 +628,9 @@ export function criarStatsBusca() {
     tempo_total_ms: 0,
     estrategias: {},
     letras: [],
-    prefixos: []
+    prefixos: [],
+    prefixos_unicos: 0,
+    consultas_giap_prefixo: 0
   };
 }
 
