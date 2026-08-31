@@ -16,7 +16,7 @@ services:
       - key: NODE_OPTIONS
         value: "--max-old-space-size=200 --expose-gc"
       - key: GIAP_MAX_BUSCAS_NOME
-        value: "3"
+        value: "50"
       - key: GIAP_MAX_VARIANTES_NOME
         value: "4"
       # Reusa o Chromium por várias buscas — corta o boot de ~8-15s por scrape.
@@ -30,7 +30,7 @@ services:
       - key: GIAP_BROWSER_RESTART_EVERY
         value: "20"
       - key: GIAP_CLOSE_BROWSER_EVERY_NOME
-        value: "5"
+        value: "999"
       - key: GIAP_BULK_META
         value: "400"
       - key: GIAP_BULK_AZ

@@ -18,6 +18,7 @@ import {
   variantesBuscaSemMatricula
 } from './utils.js';
 import { estrategiasBuscaProgressiva } from './matching.js';
+import { carregarIndiceHistorico, medirCoberturaHistorico } from './historico.js';
 import { getSupabase } from './supabase.js';
 
 const CODIGO_ORGAO_SEMCAS = process.env.GIAP_CODIGO_ORGAO || '9';
@@ -633,6 +634,67 @@ export async function listarBuscasNomePendentes(competencia) {
     });
   }
   return buscas;
+}
+
+/** CPF mascarado para relatórios (nunca expor completo). */
+export function mascararCpf(cpf) {
+  const d = String(cpf || '').replace(/\D/g, '');
+  if (d.length < 4) return null;
+  return `${d.slice(0, 3)}.***.***-${d.slice(-2)}`;
+}
+
+/**
+ * Seleciona N candidatos reais diversos entre os pendentes da competência.
+ * Prioriza grupos A/B/D/C/E, com/sem matrícula e CPF.
+ */
+export async function selecionarCandidatosDiversos(competencia, n = 50) {
+  const cedencias = await carregarCedenciasAtuais();
+  const indiceHistorico = await carregarIndiceHistorico(competencia);
+  const todos = await listarBuscasNomePendentes(competencia);
+  const { stats: statsCobertura, pendentes: enriquecidos } = medirCoberturaHistorico(
+    todos,
+    indiceHistorico,
+    cedencias
+  );
+
+  const selected = new Map();
+  const pick = (pred, max) => {
+    for (const p of enriquecidos) {
+      if (selected.size >= n) break;
+      if (selected.has(p.funcionario_id)) continue;
+      if (!pred(p)) continue;
+      if (max != null && [...selected.values()].filter(pred).length >= max) continue;
+      selected.set(p.funcionario_id, p);
+    }
+  };
+
+  pick((p) => p.grupo_historico === 'A', Math.ceil(n * 0.35));
+  pick((p) => p.grupo_historico === 'B', Math.ceil(n * 0.2));
+  pick((p) => p.grupo_historico === 'D', Math.max(3, Math.ceil(n * 0.06)));
+  pick((p) => !p.tem_matricula, Math.ceil(n * 0.2));
+  pick((p) => p.grupo_historico === 'E', Math.ceil(n * 0.1));
+  pick((p) => p.cpf, Math.ceil(n * 0.5));
+  pick(() => true, null);
+
+  const candidatos = [...selected.values()].slice(0, n);
+  return {
+    candidatos,
+    stats_selecao: {
+      solicitados: n,
+      selecionados: candidatos.length,
+      grupo_A: candidatos.filter((c) => c.grupo_historico === 'A').length,
+      grupo_B: candidatos.filter((c) => c.grupo_historico === 'B').length,
+      grupo_C: candidatos.filter((c) => c.grupo_historico === 'C').length,
+      grupo_D: candidatos.filter((c) => c.grupo_historico === 'D').length,
+      grupo_E: candidatos.filter((c) => c.grupo_historico === 'E').length,
+      com_matricula: candidatos.filter((c) => c.tem_matricula).length,
+      sem_matricula: candidatos.filter((c) => !c.tem_matricula).length,
+      com_cpf: candidatos.filter((c) => c.cpf).length,
+      cedidos: candidatos.filter((c) => c.eh_cedido).length
+    },
+    cobertura_total: statsCobertura,
+    pendentes_total: todos.length
+  };
 }
 
 /** @deprecated use listarBuscasNomePendentes — mantido p/ scripts antigos. */

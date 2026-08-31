@@ -103,13 +103,42 @@ function dedupePorChave(registros) {
 /** Upsert em lote idempotente em folha_pmsl. */
 export async function upsertRegistrosFolha(registros) {
   const deduped = dedupePorChave((registros || []).filter((r) => r.matricula));
-  if (!deduped.length) return { inseridos: 0, registros: [] };
+  if (!deduped.length) {
+    return { inseridos: 0, registros: [], novos: 0, atualizados: 0, ignorados: 0 };
+  }
+
+  const competencia = deduped[0].competencia;
+  const matriculas = deduped.map((r) => String(r.matricula));
+  const { data: existentes, error: errSel } = await sb()
+    .from('folha_pmsl')
+    .select('matricula')
+    .eq('competencia', competencia)
+    .in('matricula', matriculas);
+  if (errSel) throw errSel;
+
+  const matsExistentes = new Set((existentes || []).map((r) => String(r.matricula)));
+
   const { error, data } = await sb()
     .from('folha_pmsl')
     .upsert(deduped, { onConflict: 'competencia,matricula,codigo_instituicao' })
-    .select('id, matricula, funcionario, cpf, lotacao');
+    .select('id, matricula, funcionario, cpf, lotacao, codigo_orgao');
   if (error) throw error;
-  return { inseridos: data?.length || 0, registros: data || [] };
+
+  const rows = data || [];
+  let novos = 0;
+  let atualizados = 0;
+  for (const row of rows) {
+    if (matsExistentes.has(String(row.matricula))) atualizados++;
+    else novos++;
+  }
+
+  return {
+    inseridos: rows.length,
+    registros: rows,
+    novos,
+    atualizados,
+    ignorados: 0
+  };
 }
 
 /**

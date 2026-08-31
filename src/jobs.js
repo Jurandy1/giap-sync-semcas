@@ -523,13 +523,19 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao, filt
           todasPendentes = cov.pendentes;
           statsHistorico = cov.stats;
           console.log(JSON.stringify({ evento: 'giap_historico_cobertura', competencia, ...cov.stats }));
+
+          if (Array.isArray(filtros.funcionario_ids) && filtros.funcionario_ids.length) {
+            const ids = new Set(filtros.funcionario_ids.map(Number));
+            todasPendentes = todasPendentes.filter((p) => ids.has(p.funcionario_id));
+          }
         } catch (e) {
           console.warn('[jobs] listar pendentes antes do bulk:', e.message);
         }
       }
 
-      // Fase bulk: órgão + A–Z adaptativo no 1º lote e se folha < GIAP_BULK_META
-      if (isPrimeiroLote && folhaAntes < GIAP_BULK_META && !pularBuscasNome) {
+      // Fase bulk: prefixos deduplicados no 1º lote (pular se filtros.pularBulk)
+      const pularBulkFase = filtros.pularBulk === true;
+      if (isPrimeiroLote && folhaAntes < GIAP_BULK_META && !pularBuscasNome && !pularBulkFase) {
         await updateJob(jobId, {
           progresso_pct: 2,
           resumo: {
@@ -545,6 +551,7 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao, filt
           codigoOrgao: String(codigoOrgao),
           pendentes: todasPendentes,
           metricas,
+          manterBrowser: true,
           comTimeout,
           watchdogMs: SCRAPE_WATCHDOG_MS,
           onProgress: async (p) => {
@@ -595,12 +602,14 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao, filt
 
       let buscasNome = [];
       let buscasPendentes = 0;
+      let maxBuscasEfetivo = MAX_BUSCAS_NOME;
       let totalPendentesInicial = Number(filtros._total_inicial || todasPendentes.length || 0);
       let buscaInteligenteRes = null;
       verificadosNome = new Set();
       matriculasBusca = new Map();
 
       if (!pularBuscasNome) {
+        maxBuscasEfetivo = Math.max(1, Number(filtros.maxBuscas ?? MAX_BUSCAS_NOME));
         todasPendentes.sort((a, b) => {
           const ord = { A: 0, B: 1, D: 2, C: 3, E: 4 };
           const ga = ord[a.grupo_historico] ?? 5;
@@ -613,9 +622,9 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao, filt
         });
         totalPendentesInicial = Number(filtros._total_inicial || todasPendentes.length);
         metricas.setTotalServidores(totalPendentesInicial);
-        buscasPendentes = Math.max(0, todasPendentes.length - MAX_BUSCAS_NOME);
-        buscasNome = todasPendentes.slice(0, MAX_BUSCAS_NOME);
-        const lotesRestantes = Math.ceil(buscasPendentes / Math.max(1, MAX_BUSCAS_NOME));
+        buscasPendentes = Math.max(0, todasPendentes.length - maxBuscasEfetivo);
+        buscasNome = todasPendentes.slice(0, maxBuscasEfetivo);
+        const lotesRestantes = Math.ceil(buscasPendentes / Math.max(1, maxBuscasEfetivo));
         metricas.setLote(cadeiaAtual + 1, lotesRestantes);
         metricas.setPendentes(buscasPendentes);
       }
@@ -635,7 +644,7 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao, filt
           indiceHistorico,
           cedencias,
           codigoOrgao: String(codigoOrgao),
-          maxBuscas: MAX_BUSCAS_NOME,
+          maxBuscas: maxBuscasEfetivo,
           comTimeout,
           watchdogMs: SCRAPE_WATCHDOG_MS,
           metricas,
@@ -674,9 +683,7 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao, filt
       const nomesSemMatricula = 0;
       const scrapesNome = buscaInteligenteRes?.scrapes_nome || 0;
 
-      if (scrapesNome > 0 && scrapesNome % CLOSE_BROWSER_EVERY_NOME === 0) {
-        await closeBrowser().catch(() => {});
-      }
+      // Restart controlado pelo scraper (GIAP_RESTART_BROWSER_AFTER_N) — não fechar aqui
 
       // Recalcula pendentes reais após bulk + busca inteligente
       if (!pularBuscasNome) {

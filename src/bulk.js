@@ -118,7 +118,8 @@ export async function executarFaseBulk({
   metricas = null,
   comTimeout = null,
   watchdogMs = 180000,
-  onProgress = null
+  onProgress = null,
+  manterBrowser = false
 } = {}) {
   const tBulk = Date.now();
   const folhaAntes = await contarFolhaBulk(competencia, codigoOrgao);
@@ -304,7 +305,9 @@ export async function executarFaseBulk({
     stats.letras.push(detalhe);
   }
 
-  await closeBrowser().catch(() => {});
+  if (!manterBrowser) {
+    await closeBrowser().catch(() => {});
+  }
   stats.tempo_bulk_ms = Date.now() - tBulk;
   stats.bulk_util = indice.size;
   resultado.folha_depois = await contarFolhaBulk(competencia, codigoOrgao);

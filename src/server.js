@@ -42,6 +42,7 @@ app.get('/', (req, res) => {
       'POST /debug/benchmark       {competencia?} — HTTP vs Puppeteer (não altera folha)',
       'POST /debug/investigar-request-url {competencia?, prefixos?} — P6_REQUEST_URL (não altera folha)',
       'POST /debug/teste-apex-sequencial {n?, competencia?} — N consultas APEX reutilizadas',
+      'POST /debug/teste-folha-50 {competencia?, n?, idempotencia?} — importação real controlada',
       'POST /buscar',
       'POST /sync/orgao',
       'POST /sync/orgaos',
@@ -106,6 +107,24 @@ app.post('/debug/teste-apex-sequencial', async (req, res) => {
     res.json(relatorio);
   } catch (e) {
     console.error('[/debug/teste-apex-sequencial]', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/debug/teste-folha-50', async (req, res) => {
+  try {
+    const competencia = Number(req.body.competencia || competenciaAtual());
+    if (!validarCompetencia(competencia)) return res.status(400).json({ error: 'competencia inválida' });
+    const { executarTesteFolha50EFechar } = await import('./teste-folha-50.js');
+    const relatorio = await executarTesteFolha50EFechar({
+      competencia,
+      n: Math.min(50, Number(req.body.n || 50)),
+      funcionario_ids: req.body.funcionario_ids,
+      idempotencia: req.body.idempotencia !== false
+    });
+    res.json(relatorio);
+  } catch (e) {
+    console.error('[/debug/teste-folha-50]', e);
     res.status(500).json({ error: e.message });
   }
 });

@@ -25,6 +25,47 @@ import {
   historicoEhConfiavel
 } from './historico.js';
 
+function origemMatchDeResultado(r) {
+  const fatores = r.avaliacao?.fatores || [];
+  const via = r.via || '';
+  if (via === 'bulk_local' || r.estrategia?.startsWith?.('prefixo')) return 'prefixo';
+  if (via === 'indice_local' || via === 'bulk_local') return 'bulk';
+  if (via === 'historico' || fatores.some((f) => /historico/i.test(f))) return 'historico';
+  if (fatores.some((f) => /matricula/i.test(f) && !/historico/i.test(f))) return 'matricula';
+  if (fatores.some((f) => /cpf/i.test(f))) return 'cpf';
+  if (via === 'nome') return 'nome';
+  return via || 'desconhecido';
+}
+
+function registrarMatchPorOrigem(stats, origem) {
+  const k = `matches_por_${origem}`;
+  if (stats[k] != null) stats[k]++;
+  else stats[k] = 1;
+}
+
+function linhaDetalheCandidato(pendente, r, opts = {}) {
+  const reg = r?.registros?.[0];
+  return {
+    funcionario_id: pendente.funcionario_id,
+    nome_rh: pendente.nome,
+    matricula_rh: pendente.matricula || null,
+    cpf_mascarado: pendente.cpf ? `***${String(pendente.cpf).slice(-4)}` : null,
+    grupo: pendente.grupo_historico,
+    eh_cedido: !!pendente.eh_cedido,
+    nome_giap: reg?.funcionario || r?.nome_giap || null,
+    matricula_giap: reg?.matricula ?? null,
+    codigo_orgao: reg?.codigo_orgao ?? r?.item?.codigo_orgao ?? null,
+    origem_match: r ? origemMatchDeResultado(r) : null,
+    via: r?.via || null,
+    estrategia: r?.estrategia || null,
+    classificacao: r?.classificacao || opts.classificacao || null,
+    score: r?.avaliacao?.sim ?? null,
+    status: opts.status || (r ? 'match' : 'sem_match'),
+    tempo_ms: opts.tempo_ms ?? null,
+    motivo: opts.motivo || r?.avaliacao?.motivo || null
+  };
+}
+
 export async function processarPendentesInteligente({
   pendentes,
   competencia,
@@ -40,6 +81,20 @@ export async function processarPendentesInteligente({
   onProgress = null
 } = {}) {
   const stats = criarStatsBusca();
+  stats.matches_por_historico = 0;
+  stats.matches_por_matricula = 0;
+  stats.matches_por_cpf = 0;
+  stats.matches_por_nome = 0;
+  stats.matches_por_bulk = 0;
+  stats.matches_por_prefixo = 0;
+  stats.cedidos_resolvidos = 0;
+  stats.rejeitados = 0;
+  stats.registros_novos = 0;
+  stats.registros_atualizados = 0;
+  stats.consultas_giap = 0;
+  stats.candidatos_processados = 0;
+  stats.prefixos_unicos_exec = 0;
+  const detalhesCandidatos = [];
   const t0 = Date.now();
   const indice = bulkIndex || new GiapBulkIndex();
   const jobCache = cache || new GiapSearchCache();
@@ -75,18 +130,24 @@ export async function processarPendentesInteligente({
   for (const m of cruzado.matches) {
     if (m.pendente.eh_cedido || m.pendente.grupo_historico === 'D') stats.cedidos_processados++;
     const reg = transformar({ ...m.item, competencia });
-    const { inseridos, registros } = await upsertRegistrosFolha([reg]);
-    if (inseridos > 0) {
+    const ups = await upsertRegistrosFolha([reg]);
+    if (ups.inseridos > 0) {
       stats.resultados_por_bulk++;
-      gravadosBulk.push({
+      stats.registros_novos += ups.novos || 0;
+      stats.registros_atualizados += ups.atualizados || 0;
+      const rObj = {
         pendente: m.pendente,
-        registros,
+        registros: ups.registros,
         classificacao: m.classificacao,
         avaliacao: m.score,
         via: 'bulk_local'
-      });
+      };
+      gravadosBulk.push(rObj);
+      registrarMatchPorOrigem(stats, 'bulk');
+      if (m.pendente.eh_cedido) stats.cedidos_resolvidos++;
+      detalhesCandidatos.push(linhaDetalheCandidato(m.pendente, rObj));
       jobCache.marcarResolvido(m.pendente.funcionario_id);
-      metricas?.registrarUpsert(inseridos);
+      metricas?.registrarUpsert(ups.inseridos);
     }
   }
 
@@ -105,6 +166,8 @@ export async function processarPendentesInteligente({
 
   for (let i = 0; i < fila.length; i++) {
     const pendente = fila[i];
+    stats.candidatos_processados++;
+    const tCand = Date.now();
     if (jobCache.jaResolvido(pendente.funcionario_id)) continue;
 
     const ehCedido =
@@ -124,31 +187,45 @@ export async function processarPendentesInteligente({
     });
     if (localPre?.classificacao === CLASSIFICACAO.DIVERGENCIA) {
       stats.divergencias++;
+      stats.rejeitados++;
       divergencias.push({ pendente, item: localPre.item, avaliacao: localPre.avaliacao, estrategia: 'indice_local' });
       stats.sem_match++;
+      detalhesCandidatos.push(
+        linhaDetalheCandidato(pendente, null, {
+          status: 'divergencia',
+          classificacao: CLASSIFICACAO.DIVERGENCIA,
+          motivo: localPre.avaliacao?.motivo
+        })
+      );
       continue;
     }
     if (localPre && deveGravarMatch(localPre.avaliacao)) {
       const reg = transformar({ ...localPre.item, competencia });
-      const { inseridos, registros } = await upsertRegistrosFolha([reg]);
-      if (inseridos > 0) {
+      const ups = await upsertRegistrosFolha([reg]);
+      if (ups.inseridos > 0) {
         stats.matches_nome++;
         stats.resultados_por_bulk++;
+        stats.registros_novos += ups.novos || 0;
+        stats.registros_atualizados += ups.atualizados || 0;
         stats.chamadas_giap_evitadas++;
         stats.chamadas_giap_evitadas_matching_local++;
         if (usaHistorico) stats.chamadas_giap_evitadas_historico++;
         if (localPre.avaliacao.classificacao === CLASSIFICACAO.SEGURO) stats.matches_seguros++;
         else stats.matches_provaveis++;
-        jobCache.marcarResolvido(pendente.funcionario_id);
-        metricas?.registrarUpsert(inseridos);
-        resultados.push({
+        const rObj = {
           pendente,
-          registros,
+          registros: ups.registros,
           classificacao: localPre.classificacao,
           avaliacao: localPre.avaliacao,
           via: 'indice_local',
           estrategia: 'indice_local'
-        });
+        };
+        registrarMatchPorOrigem(stats, origemMatchDeResultado(rObj));
+        if (ehCedido) stats.cedidos_resolvidos++;
+        detalhesCandidatos.push(linhaDetalheCandidato(pendente, rObj));
+        jobCache.marcarResolvido(pendente.funcionario_id);
+        metricas?.registrarUpsert(ups.inseridos);
+        resultados.push(rObj);
         continue;
       }
     }
@@ -200,6 +277,7 @@ export async function processarPendentesInteligente({
           jobCache.set(cacheKey, { data, duracao_ms: duracaoMs });
           scrapesNome++;
           stats.buscas_nome++;
+          stats.consultas_giap++;
           metricas?.registrarScrape('nome', duracaoMs);
           registrarEstrategia(
             stats,
@@ -256,6 +334,7 @@ export async function processarPendentesInteligente({
 
     if (melhorDivergencia && !matchFinal) {
       stats.divergencias++;
+      stats.rejeitados++;
       divergencias.push({ pendente, ...melhorDivergencia });
       if (debugNomes.length < 8) {
         debugNomes.push({
@@ -268,34 +347,55 @@ export async function processarPendentesInteligente({
           estrategia: melhorDivergencia.estrategia
         });
       }
+      detalhesCandidatos.push(
+        linhaDetalheCandidato(pendente, null, {
+          status: 'divergencia',
+          classificacao: CLASSIFICACAO.DIVERGENCIA,
+          motivo: melhorDivergencia.avaliacao?.motivo,
+          tempo_ms: Date.now() - tCand
+        })
+      );
       stats.sem_match++;
       continue;
     }
 
     if (matchFinal && avalFinal) {
       const reg = transformar({ ...matchFinal, competencia });
-      const { inseridos, registros } = await upsertRegistrosFolha([reg]);
-      if (inseridos > 0) {
+      const ups = await upsertRegistrosFolha([reg]);
+      if (ups.inseridos > 0) {
         stats.matches_nome++;
+        stats.registros_novos += ups.novos || 0;
+        stats.registros_atualizados += ups.atualizados || 0;
         if (usaHistorico) stats.resultados_por_historico++;
         else stats.resultados_por_nome++;
         if (avalFinal.classificacao === CLASSIFICACAO.SEGURO) stats.matches_seguros++;
         else stats.matches_provaveis++;
-        if (ehCedido) stats.cedidos_processados++;
-        jobCache.marcarResolvido(pendente.funcionario_id);
-        metricas?.registrarUpsert(inseridos);
-        resultados.push({
+        if (ehCedido) {
+          stats.cedidos_processados++;
+          stats.cedidos_resolvidos++;
+        }
+        const rObj = {
           pendente,
-          registros,
+          registros: ups.registros,
           classificacao: avalFinal.classificacao,
           avaliacao: avalFinal,
           estrategia: estrategiaUsada,
           via: usaHistorico ? 'historico' : 'nome',
           nome_giap: matchFinal.funcionario,
           historico_comp: pendente.historico?.competencia
-        });
+        };
+        registrarMatchPorOrigem(stats, origemMatchDeResultado(rObj));
+        detalhesCandidatos.push(
+          linhaDetalheCandidato(pendente, rObj, { tempo_ms: Date.now() - tCand })
+        );
+        jobCache.marcarResolvido(pendente.funcionario_id);
+        metricas?.registrarUpsert(ups.inseridos);
+        resultados.push(rObj);
       } else {
         stats.sem_match++;
+        detalhesCandidatos.push(
+          linhaDetalheCandidato(pendente, null, { status: 'sem_match', tempo_ms: Date.now() - tCand })
+        );
       }
     } else {
       stats.sem_match++;
@@ -312,6 +412,9 @@ export async function processarPendentesInteligente({
           classificacao: CLASSIFICACAO.SEM_MATCH
         });
       }
+      detalhesCandidatos.push(
+        linhaDetalheCandidato(pendente, null, { status: 'sem_match', tempo_ms: Date.now() - tCand })
+      );
     }
 
     if (onProgress) {
@@ -337,7 +440,8 @@ export async function processarPendentesInteligente({
     buscas_nome: fila.length,
     buscas_nome_pendentes: Math.max(0, restantes.length - fila.length),
     debug_nomes: debugNomes,
-    gravados_bulk: gravadosBulk.length
+    gravados_bulk: gravadosBulk.length,
+    detalhes_candidatos: detalhesCandidatos
   };
 }
 
