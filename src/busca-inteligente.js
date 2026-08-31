@@ -1,30 +1,33 @@
 /**
- * Busca inteligente: índice bulk → matching local → estratégias progressivas com cache.
- * Não altera funcionarios.* — só grava folha_pmsl quando associação é conservadora.
+ * Busca inteligente: histórico → índice bulk → matching local → busca por exceção.
  */
 import { scrapeRemuneracoes } from './scraper.js';
 import { transformar, upsertRegistrosFolha } from './sync.js';
 import {
-  estrategiasBuscaProgressiva,
   avaliarMatch,
   deveGravarMatch,
-  classificarPendentes,
   cruzarComIndice,
   GiapBulkIndex,
   GiapSearchCache,
   criarStatsBusca,
   registrarEstrategia,
   resumoEstrategias,
-  maxVariantesNome,
   CLASSIFICACAO,
   matKey
 } from './matching.js';
+import {
+  estrategiasComHistorico,
+  medirCoberturaHistorico,
+  carregarIndiceHistorico,
+  historicoEhConfiavel
+} from './historico.js';
 
 export async function processarPendentesInteligente({
   pendentes,
   competencia,
   bulkIndex = null,
   cache = null,
+  indiceHistorico = null,
   cedencias = { ids: new Set(), mats: new Set() },
   maxBuscas = 3,
   comTimeout = null,
@@ -37,16 +40,21 @@ export async function processarPendentesInteligente({
   const indice = bulkIndex || new GiapBulkIndex();
   const jobCache = cache || new GiapSearchCache();
   const matsCedidos = new Set([...cedencias.mats].map((m) => matKey(m)).filter(Boolean));
-  const maxVar = maxVariantesNome();
 
-  stats.total_rh = pendentes.length;
-  stats.total_pendentes = pendentes.length;
-  stats.pendentes_iniciais = pendentes.length;
+  const histIdx = indiceHistorico || (await carregarIndiceHistorico(competencia));
+  const { stats: histStats, pendentes: enriquecidos } = medirCoberturaHistorico(
+    pendentes,
+    histIdx,
+    cedencias
+  );
+  Object.assign(stats, histStats);
+
+  stats.total_rh = enriquecidos.length;
+  stats.total_pendentes = enriquecidos.length;
+  stats.pendentes_iniciais = enriquecidos.length;
   stats.bulk_util = indice.size;
 
-  const { ordem } = classificarPendentes(pendentes, cedencias);
-
-  const cruzado = cruzarComIndice(ordem, indice, {
+  const cruzado = cruzarComIndice(enriquecidos, indice, {
     matsCedidos,
     cedidosIds: cedencias.ids
   });
@@ -55,20 +63,23 @@ export async function processarPendentesInteligente({
   stats.matches_provaveis += cruzado.stats.matches_provaveis;
   stats.divergencias += cruzado.stats.divergencias;
   stats.chamadas_giap_evitadas += cruzado.stats.chamadas_giap_evitadas;
+  stats.chamadas_giap_evitadas_matching_local += cruzado.stats.chamadas_giap_evitadas;
 
   const gravadosBulk = [];
   const divergencias = [...(cruzado.divergencias || [])];
 
   for (const m of cruzado.matches) {
-    if (m.pendente.eh_cedido || m.pendente.grupo === 'D') stats.cedidos_processados++;
+    if (m.pendente.eh_cedido || m.pendente.grupo_historico === 'D') stats.cedidos_processados++;
     const reg = transformar({ ...m.item, competencia });
     const { inseridos, registros } = await upsertRegistrosFolha([reg]);
     if (inseridos > 0) {
+      stats.resultados_por_bulk++;
       gravadosBulk.push({
         pendente: m.pendente,
         registros,
         classificacao: m.classificacao,
-        avaliacao: m.score
+        avaliacao: m.score,
+        via: 'bulk_local'
       });
       jobCache.marcarResolvido(m.pendente.funcionario_id);
       metricas?.registrarUpsert(inseridos);
@@ -93,10 +104,13 @@ export async function processarPendentesInteligente({
     if (jobCache.jaResolvido(pendente.funcionario_id)) continue;
 
     const ehCedido =
+      pendente.eh_cedido ||
       cedencias.ids.has(pendente.funcionario_id) ||
       (pendente.matricula && cedencias.mats.has(String(pendente.matricula).trim()));
 
-    const estrategias = estrategiasBuscaProgressiva(pendente.nome, maxVar);
+    const usaHistorico = historicoEhConfiavel(pendente.historico);
+    const estrategias = estrategiasComHistorico(pendente, pendente.historico);
+
     let matchFinal = null;
     let avalFinal = null;
     let melhorDivergencia = null;
@@ -115,6 +129,7 @@ export async function processarPendentesInteligente({
         data = cacheHit.data || [];
         duracaoMs = cacheHit.duracao_ms || 0;
         stats.chamadas_giap_evitadas++;
+        if (usaHistorico) stats.chamadas_giap_evitadas_historico++;
         registrarEstrategia(stats, `${estrategia}_cache`, data.length > 0, duracaoMs);
       } else {
         const t1 = Date.now();
@@ -135,7 +150,12 @@ export async function processarPendentesInteligente({
           scrapesNome++;
           stats.buscas_nome++;
           metricas?.registrarScrape('nome', duracaoMs);
-          registrarEstrategia(stats, estrategia, data.length > 0, duracaoMs);
+          registrarEstrategia(
+            stats,
+            usaHistorico ? `historico:${estrategia}` : estrategia,
+            data.length > 0,
+            duracaoMs
+          );
         } catch (e) {
           metricas?.registrarErro();
           registrarEstrategia(stats, estrategia, false, Date.now() - t1);
@@ -146,7 +166,7 @@ export async function processarPendentesInteligente({
       bruto = data.length;
       if (!data.length) continue;
 
-      indice.addItems(data, `nome:${estrategia}`);
+      indice.addItems(data, usaHistorico ? `historico:${estrategia}` : `nome:${estrategia}`);
 
       let melhor = null;
       let melhorAv = null;
@@ -185,20 +205,16 @@ export async function processarPendentesInteligente({
 
     if (melhorDivergencia && !matchFinal) {
       stats.divergencias++;
-      divergencias.push({
-        pendente,
-        ...melhorDivergencia,
-        nome_giap: melhorDivergencia.item?.funcionario
-      });
+      divergencias.push({ pendente, ...melhorDivergencia });
       if (debugNomes.length < 8) {
         debugNomes.push({
           nome_rh: pendente.nome,
           matricula_rh: pendente.matricula,
           classificacao: CLASSIFICACAO.DIVERGENCIA,
           motivo: melhorDivergencia.avaliacao?.motivo,
-          estrategia: melhorDivergencia.estrategia,
-          nome_giap: melhorDivergencia.item?.funcionario,
-          matricula_giap: melhorDivergencia.item?.matricula
+          historico_comp: pendente.historico?.competencia,
+          nome_giap_hist: pendente.historico?.funcionario,
+          estrategia: melhorDivergencia.estrategia
         });
       }
       stats.sem_match++;
@@ -210,6 +226,8 @@ export async function processarPendentesInteligente({
       const { inseridos, registros } = await upsertRegistrosFolha([reg]);
       if (inseridos > 0) {
         stats.matches_nome++;
+        if (usaHistorico) stats.resultados_por_historico++;
+        else stats.resultados_por_nome++;
         if (avalFinal.classificacao === CLASSIFICACAO.SEGURO) stats.matches_seguros++;
         else stats.matches_provaveis++;
         if (ehCedido) stats.cedidos_processados++;
@@ -221,7 +239,9 @@ export async function processarPendentesInteligente({
           classificacao: avalFinal.classificacao,
           avaliacao: avalFinal,
           estrategia: estrategiaUsada,
-          nome_giap: matchFinal.funcionario
+          via: usaHistorico ? 'historico' : 'nome',
+          nome_giap: matchFinal.funcionario,
+          historico_comp: pendente.historico?.competencia
         });
       } else {
         stats.sem_match++;
@@ -232,6 +252,9 @@ export async function processarPendentesInteligente({
         debugNomes.push({
           nome_rh: pendente.nome,
           matricula_rh: pendente.matricula,
+          grupo: pendente.grupo_historico,
+          historico_comp: pendente.historico?.competencia,
+          nome_giap_hist: pendente.historico?.funcionario,
           estrategias_tentadas: estrategias,
           ultima_busca: ultimaBusca,
           bruto,
@@ -241,7 +264,7 @@ export async function processarPendentesInteligente({
     }
 
     if (onProgress) {
-      await onProgress({ i: i + 1, total: fila.length, nome: pendente.nome });
+      await onProgress({ i: i + 1, total: fila.length, nome: pendente.nome, grupo: pendente.grupo_historico });
     }
   }
 
@@ -250,17 +273,15 @@ export async function processarPendentesInteligente({
   stats.chamadas_giap_evitadas += jobCache.hits;
   stats.estrategias_resumo = resumoEstrategias(stats);
 
-  const nomesEncontrados =
-    resultados.filter((r) => r.classificacao !== CLASSIFICACAO.DIVERGENCIA).length;
-
   return {
     stats,
     indice,
     cache: jobCache,
     resultados,
     divergencias,
+    historico: histStats,
     scrapes_nome: scrapesNome,
-    nomes_encontrados: nomesEncontrados,
+    nomes_encontrados: resultados.length,
     nomes_vazios: stats.sem_match,
     buscas_nome: fila.length,
     buscas_nome_pendentes: Math.max(0, restantes.length - fila.length),
@@ -268,3 +289,5 @@ export async function processarPendentesInteligente({
     gravados_bulk: gravadosBulk.length
   };
 }
+
+export { carregarIndiceHistorico, medirCoberturaHistorico };

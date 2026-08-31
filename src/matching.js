@@ -94,12 +94,13 @@ export function estrategiasBuscaProgressiva(nome, max = null) {
   return out.slice(0, limite);
 }
 
-/** Prefixos de 2 tokens derivados dos pendentes (substituto mais eficiente que A–Z). */
+/** Prefixos de 2 tokens — prioriza nome GIAP histórico quando existir. */
 export function prefixosBuscaPendentes(pendentes, max = null) {
   const lim = max ?? Math.max(5, Number(process.env.GIAP_BULK_PREFIXOS_MAX || 15));
   const set = new Set();
   for (const p of pendentes || []) {
-    const sig = tokensSignificativos(p.nome);
+    const nomeBase = p.historico?.funcionario || p.nome;
+    const sig = tokensSignificativos(nomeBase);
     if (sig.length >= 2) {
       set.add([sig[0], sig[1]].join(' '));
       set.add([sig[0], sig[sig.length - 1]].join(' '));
@@ -177,11 +178,38 @@ export function avaliarMatch(pendente, itemGiap, opts = {}) {
 
   const matRh = pendente.matricula ? matKey(pendente.matricula) : null;
   const matGiap = itemGiap.matricula ? matKey(itemGiap.matricula) : null;
+  const matHist = pendente.historico?.matricula ? matKey(pendente.historico.matricula) : null;
   base.matRh = matRh;
   base.matGiap = matGiap;
 
   const cpfRh = pendente.cpf ? normalizarCPF(pendente.cpf) : null;
   const cpfGiap = itemGiap.cpf ? normalizarCPF(itemGiap.cpf) : null;
+  const cpfHist = pendente.historico?.cpf ? normalizarCPF(pendente.historico.cpf) : null;
+
+  // Âncora histórica: matrícula/CPF de competência anterior confirma identidade
+  if (matHist && matGiap && matHist === matGiap) {
+    const nomeHistOk =
+      !pendente.historico?.funcionario ||
+      nomeCasaPermissivo(pendente.historico.funcionario, nomeGiap) ||
+      similaridadeNome(pendente.historico.funcionario, nomeGiap) >= 0.85;
+    if (nomeHistOk || nomeCompat || ehCedido) {
+      return {
+        ...base,
+        classificacao: CLASSIFICACAO.SEGURO,
+        motivo: 'historico_matricula_confere',
+        fatores: ['historico_matricula_ok', nomeHistOk ? 'nome_historico_ok' : 'nome_rh_ok'].filter(Boolean)
+      };
+    }
+  }
+
+  if (cpfHist && cpfGiap && cpfHist === cpfGiap && (nomeCompat || nomeCasaPermissivo(pendente.historico?.funcionario, nomeGiap))) {
+    return {
+      ...base,
+      classificacao: CLASSIFICACAO.SEGURO,
+      motivo: 'historico_cpf_confere',
+      fatores: ['historico_cpf_ok', 'nome_compativel']
+    };
+  }
 
   const admOk = admissaoCompativel(pendente, itemGiap);
   const admConflito = admOk === false;
@@ -363,6 +391,9 @@ export class GiapBulkIndex {
     if (pendente.matricula) {
       for (const item of this.porMat.get(matKey(pendente.matricula)) || []) add(item);
     }
+    if (pendente.historico?.matricula) {
+      for (const item of this.porMat.get(matKey(pendente.historico.matricula)) || []) add(item);
+    }
     const ft = tokensSignificativos(pendente.nome)[0];
     if (ft) {
       for (const item of this.porPrimeiroToken.get(ft) || []) add(item);
@@ -498,6 +529,23 @@ export function criarStatsBusca() {
     divergencias: 0,
     rejeitados: 0,
     sem_match: 0,
+    historico_encontrado: 0,
+    historico_com_matricula: 0,
+    historico_com_cpf: 0,
+    historico_com_nome: 0,
+    historico_sem_matricula: 0,
+    sem_historico: 0,
+    grupo_A: 0,
+    grupo_B: 0,
+    grupo_C: 0,
+    grupo_D: 0,
+    grupo_E: 0,
+    resultados_por_historico: 0,
+    resultados_por_bulk: 0,
+    resultados_por_nome: 0,
+    resultados_por_prefixo: 0,
+    chamadas_giap_evitadas_historico: 0,
+    chamadas_giap_evitadas_matching_local: 0,
     cedidos_processados: 0,
     chamadas_giap_evitadas: 0,
     tempo_bulk_ms: 0,

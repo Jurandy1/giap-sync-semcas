@@ -5,6 +5,7 @@ import { syncPorOrgao, syncPorNome } from './sync.js';
 import { executarFaseBulk, contarFolhaBulk, GIAP_BULK_META } from './bulk.js';
 import { criarMetricas, memoriaPressionada } from './metrics.js';
 import { processarPendentesInteligente } from './busca-inteligente.js';
+import { carregarIndiceHistorico, medirCoberturaHistorico } from './historico.js';
 import { GiapSearchCache } from './matching.js';
 import {
   enriquecerFuncionarios,
@@ -499,12 +500,24 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao, filt
       const pularBuscasNome = filtros?.pularBuscasNome === true;
       const jobCache = filtros._cache_busca ? null : new GiapSearchCache();
 
+      let indiceHistorico = null;
+      let statsHistorico = null;
+
       if (!pularBuscasNome) {
         try {
           todasPendentes = await listarBuscasNomePendentes(competencia);
           if (!filtros._total_inicial && todasPendentes.length) {
             filtros._total_inicial = todasPendentes.length;
           }
+          let cedPre = { ids: new Set(), mats: new Set() };
+          try {
+            cedPre = await carregarCedenciasAtuais();
+          } catch (_) { /* ok */ }
+          indiceHistorico = await carregarIndiceHistorico(competencia);
+          const cov = medirCoberturaHistorico(todasPendentes, indiceHistorico, cedPre);
+          todasPendentes = cov.pendentes;
+          statsHistorico = cov.stats;
+          console.log(JSON.stringify({ evento: 'giap_historico_cobertura', competencia, ...cov.stats }));
         } catch (e) {
           console.warn('[jobs] listar pendentes antes do bulk:', e.message);
         }
@@ -552,7 +565,15 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao, filt
         folhaAntes = bulkRes.folha_depois ?? folhaAntes;
         // Recarrega pendentes após bulk + matching local
         try {
-          todasPendentes = await listarBuscasNomePendentes(competencia);
+          const recarregados = await listarBuscasNomePendentes(competencia);
+          let cedPre = { ids: new Set(), mats: new Set() };
+          try {
+            cedPre = await carregarCedenciasAtuais();
+          } catch (_) { /* ok */ }
+          if (!indiceHistorico) indiceHistorico = await carregarIndiceHistorico(competencia);
+          const cov = medirCoberturaHistorico(recarregados, indiceHistorico, cedPre);
+          todasPendentes = cov.pendentes;
+          statsHistorico = cov.stats;
         } catch (_) { /* ok */ }
       } else {
         pulouBulk = true;
@@ -576,8 +597,9 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao, filt
 
       if (!pularBuscasNome) {
         todasPendentes.sort((a, b) => {
-          const ga = a.tem_matricula ? 0 : 1;
-          const gb = b.tem_matricula ? 0 : 1;
+          const ord = { A: 0, B: 1, D: 2, C: 3, E: 4 };
+          const ga = ord[a.grupo_historico] ?? 5;
+          const gb = ord[b.grupo_historico] ?? 5;
           if (ga !== gb) return ga - gb;
           return (
             (b.variantes?.[0] || b.busca || '').split(' ').length -
@@ -605,6 +627,7 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao, filt
           competencia,
           bulkIndex: bulkRes?.indice || null,
           cache: jobCache,
+          indiceHistorico,
           cedencias,
           codigoOrgao: String(codigoOrgao),
           maxBuscas: MAX_BUSCAS_NOME,
@@ -674,6 +697,7 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao, filt
       );
 
       const matchingStats = {
+        ...(statsHistorico || {}),
         ...(bulkRes?.stats || {}),
         ...(buscaInteligenteRes?.stats || {}),
         divergencias_detalhe: buscaInteligenteRes?.divergencias?.slice(0, 10) || [],
