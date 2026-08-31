@@ -31,10 +31,10 @@ let scrapesDesdeRestart = 0;
 let browserLock = Promise.resolve(); // serializa scrapes (evita 2 Chrome no free tier)
 let chromePathCache = undefined; // undefined=ainda não buscou; null=não achou
 
-/** Reinicia o Chrome a cada N consultas (free tier: 1 = sempre). */
+/** Reinicia o Chrome a cada N consultas (conservador no free tier). */
 const BROWSER_RESTART_EVERY = Math.max(
   1,
-  Number(process.env.GIAP_BROWSER_RESTART_EVERY || 1)
+  Number(process.env.GIAP_BROWSER_RESTART_EVERY || 8)
 );
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
