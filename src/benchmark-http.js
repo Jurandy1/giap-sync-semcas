@@ -3,8 +3,8 @@
  * NÃO altera folha. NÃO executa sync completa.
  */
 import { fetchRemuneracoesHttp, buildRemuneracoesUrl } from './giap-http.js';
-import { scrapeRemuneracoes, closeBrowser } from './scraper.js';
-import { getSessionCookies, isSessionReady } from './scraper-session.js';
+import { scrapeRemuneracoes, closeBrowser, getRemPageAtiva } from './scraper.js';
+import { getSessionCookies, isSessionReady, tentarHttpComSessao } from './scraper-session.js';
 import { ehFolhaSemcas } from './matching.js';
 
 export const PREFIXOS_BENCHMARK = [
@@ -29,9 +29,9 @@ function resumoHttp(r, prefixo) {
   const primeiro = lista[0];
   return {
     prefixo,
-    metodo: 'http',
+    metodo: r.metodo || r.via || 'http',
     status: r.status,
-    tempo_http_ms: r.tempo_ms,
+    tempo_http_ms: r.tempo_http_ms ?? r.tempo_ms,
     quantidade: r.count ?? lista.length,
     quantidade_semcas: contarSemcas(lista),
     primeiro_nome: primeiro?.funcionario || null,
@@ -39,6 +39,31 @@ function resumoHttp(r, prefixo) {
     ok: !!r.ok,
     erro: r.erro || null
   };
+}
+
+async function consultaHttpSessao(opts, prefixo) {
+  const page = getRemPageAtiva();
+  const hit = await tentarHttpComSessao(
+    {
+      competencia: opts.competencia,
+      codigoInstituicao: opts.codigoInstituicao,
+      codigoOrgao: opts.codigoOrgao,
+      nomeServidor: prefixo,
+      quantidade: opts.quantidade
+    },
+    page
+  );
+  if (hit) return resumoHttp(hit, prefixo);
+  return resumoHttp(
+    {
+      ok: false,
+      status: null,
+      tempo_ms: 0,
+      count: 0,
+      erro: 'http_sessao_indisponivel'
+    },
+    prefixo
+  );
 }
 
 function resumoPuppeteer(r, prefixo) {
@@ -145,25 +170,25 @@ export async function executarBenchmarkHttp({
     tempo_total_ms: boot.timing?.tempo_total ?? Date.now() - tBoot,
     tempo_obter_cookies_ms: boot.timing?.tempo_carregar_apex,
     cookies_quantidade: cookies.length,
+    cookies_nomes: cookies.map((c) => c.name).filter(Boolean),
     sessao_pronta: isSessionReady(),
+    pagina_ativa: !!getRemPageAtiva(),
     quantidade: boot.data?.length ?? 0,
     quantidade_semcas: contarSemcas(boot.data),
     primeiro_nome: boot.data?.[0]?.funcionario || null,
     timing: boot.timing
   };
 
-  // 3) HTTP com sessão — 6 prefixos
+  // 3) HTTP com sessão — 6 prefixos (Node cookies → browser fetch)
   relatorio.http_com_sessao = [];
+  const httpOpts = {
+    competencia,
+    codigoInstituicao: 1,
+    codigoOrgao: org,
+    quantidade: 100
+  };
   for (const prefixo of PREFIXOS_BENCHMARK) {
-    const r = await fetchRemuneracoesHttp({
-      competencia,
-      codigoInstituicao: 1,
-      codigoOrgao: org,
-      nomeServidor: prefixo,
-      quantidade: 100,
-      cookies
-    });
-    const item = resumoHttp(r, prefixo);
+    const item = await consultaHttpSessao(httpOpts, prefixo);
     relatorio.http_com_sessao.push(item);
     relatorio.consultas.push({ fase: 'http_sessao', ...item });
   }
@@ -190,15 +215,11 @@ export async function executarBenchmarkHttp({
   while (ciclo.length < estabilidadeN) ciclo.push(...PREFIXOS_BENCHMARK);
   for (let i = 0; i < estabilidadeN; i++) {
     const prefixo = ciclo[i];
-    const r = await fetchRemuneracoesHttp({
-      competencia,
-      codigoInstituicao: 1,
-      codigoOrgao: org,
-      nomeServidor: prefixo,
-      quantidade: 100,
-      cookies: getSessionCookies()
-    });
-    const item = { seq: i + 1, ...resumoHttp(r, prefixo), memoria_mb: memMb() };
+    const item = {
+      seq: i + 1,
+      ...(await consultaHttpSessao(httpOpts, prefixo)),
+      memoria_mb: memMb()
+    };
     relatorio.estabilidade.consultas.push(item);
   }
   relatorio.estabilidade.memoria_depois_mb = memMb();

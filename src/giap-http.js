@@ -34,9 +34,80 @@ export function cookiesParaHeader(cookies = []) {
     .join('; ');
 }
 
+function montarRespostaHttp({ ok, status, url, tempo_ms, texto, via }) {
+  const bytes = Buffer.byteLength(texto || '', 'utf8');
+
+  if (!ok) {
+    return {
+      ok: false,
+      status,
+      url,
+      tempo_ms,
+      bytes,
+      count: 0,
+      erro: `HTTP ${status}: ${String(texto || '').slice(0, 200)}`,
+      via
+    };
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(texto);
+  } catch (e) {
+    return {
+      ok: false,
+      status,
+      url,
+      tempo_ms,
+      bytes,
+      count: 0,
+      erro: `json_parse: ${e.message}`,
+      raw_prefix: String(texto || '').slice(0, 200),
+      via
+    };
+  }
+
+  const { lista, meta, erro } = normalizarRespostaLista(parsed, { requestUrl: url });
+  if (erro) {
+    return {
+      ok: false,
+      status,
+      url,
+      tempo_ms,
+      bytes,
+      count: 0,
+      erro,
+      meta,
+      via
+    };
+  }
+
+  const primeiro = lista[0]
+    ? {
+        matricula: lista[0].matricula,
+        funcionario: lista[0].funcionario,
+        codigo_orgao: lista[0].codigo_orgao,
+        lotacao: lista[0].lotacao
+      }
+    : null;
+
+  return {
+    ok: true,
+    status,
+    url,
+    tempo_ms,
+    bytes,
+    count: lista.length,
+    primeiro,
+    data: lista,
+    responseMeta: meta,
+    via
+  };
+}
+
 /**
- * GET /remuneracoes com cookies de sessão.
- * @returns {{ ok, status, url, tempo_ms, bytes, count, primeiro, data, erro, via: 'http' }}
+ * GET /remuneracoes com cookies de sessão (Node fetch).
+ * @returns {{ ok, status, url, tempo_ms, bytes, count, primeiro, data, erro, via }}
  */
 export async function fetchRemuneracoesHttp(opts = {}) {
   const t0 = Date.now();
@@ -55,75 +126,14 @@ export async function fetchRemuneracoesHttp(opts = {}) {
       signal: AbortSignal.timeout(Number(opts.timeoutMs || 30000))
     });
     const texto = await res.text();
-    const tempo_ms = Date.now() - t0;
-    const bytes = Buffer.byteLength(texto, 'utf8');
-
-    if (!res.ok) {
-      return {
-        ok: false,
-        status: res.status,
-        url,
-        tempo_ms,
-        bytes,
-        count: 0,
-        erro: `HTTP ${res.status}: ${texto.slice(0, 200)}`,
-        via: 'http'
-      };
-    }
-
-    let parsed;
-    try {
-      parsed = JSON.parse(texto);
-    } catch (e) {
-      return {
-        ok: false,
-        status: res.status,
-        url,
-        tempo_ms,
-        bytes,
-        count: 0,
-        erro: `json_parse: ${e.message}`,
-        raw_prefix: texto.slice(0, 200),
-        via: 'http'
-      };
-    }
-
-    const { lista, meta, erro } = normalizarRespostaLista(parsed, { requestUrl: url });
-    if (erro) {
-      return {
-        ok: false,
-        status: res.status,
-        url,
-        tempo_ms,
-        bytes,
-        count: 0,
-        erro,
-        meta,
-        via: 'http'
-      };
-    }
-
-    const primeiro = lista[0]
-      ? {
-          matricula: lista[0].matricula,
-          funcionario: lista[0].funcionario,
-          codigo_orgao: lista[0].codigo_orgao,
-          lotacao: lista[0].lotacao
-        }
-      : null;
-
-    return {
-      ok: true,
+    return montarRespostaHttp({
+      ok: res.ok,
       status: res.status,
       url,
-      tempo_ms,
-      bytes,
-      count: lista.length,
-      primeiro,
-      data: lista,
-      responseMeta: meta,
-      via: 'http'
-    };
+      tempo_ms: Date.now() - t0,
+      texto,
+      via: 'http_node'
+    });
   } catch (e) {
     return {
       ok: false,
@@ -132,7 +142,57 @@ export async function fetchRemuneracoesHttp(opts = {}) {
       bytes: 0,
       count: 0,
       erro: e.message,
-      via: 'http'
+      via: 'http_node'
+    };
+  }
+}
+
+/**
+ * GET /remuneracoes via fetch() no contexto do browser (cookies HttpOnly da sessão APEX).
+ */
+export async function fetchRemuneracoesViaPage(page, opts = {}) {
+  const t0 = Date.now();
+  const url = opts.url || buildRemuneracoesUrl(opts);
+  if (!page) {
+    return {
+      ok: false,
+      url,
+      tempo_ms: 0,
+      bytes: 0,
+      count: 0,
+      erro: 'pagina_indisponivel',
+      via: 'http_browser'
+    };
+  }
+
+  try {
+    const raw = await page.evaluate(async (fetchUrl) => {
+      const res = await fetch(fetchUrl, {
+        method: 'GET',
+        credentials: 'include',
+        headers: { Accept: 'application/json, text/plain, */*' }
+      });
+      const text = await res.text();
+      return { status: res.status, ok: res.ok, text };
+    }, url);
+
+    return montarRespostaHttp({
+      ok: raw.ok,
+      status: raw.status,
+      url,
+      tempo_ms: Date.now() - t0,
+      texto: raw.text,
+      via: 'http_browser'
+    });
+  } catch (e) {
+    return {
+      ok: false,
+      url,
+      tempo_ms: Date.now() - t0,
+      bytes: 0,
+      count: 0,
+      erro: e.message,
+      via: 'http_browser'
     };
   }
 }

@@ -398,15 +398,18 @@ async function scrapeRemuneracoesOnce({
   const orgRaw = codigoOrgao != null && codigoOrgao !== '' ? String(codigoOrgao).trim() : '';
   const enviarOrgao = !!(orgRaw && nome);
 
-  // Caminho A: HTTP direto com cookies da sessão APEX (sem navegar/clicar)
+  // Caminho A: HTTP com sessão APEX (Node cookies ou fetch no browser)
   const tHttp = Date.now();
-  const httpHit = await tentarHttpComSessao({
-    competencia,
-    codigoInstituicao,
-    codigoOrgao: enviarOrgao ? orgRaw : '',
-    nomeServidor: nome,
-    quantidade
-  });
+  const httpHit = await tentarHttpComSessao(
+    {
+      competencia,
+      codigoInstituicao,
+      codigoOrgao: enviarOrgao ? orgRaw : '',
+      nomeServidor: nome,
+      quantidade
+    },
+    remPage
+  );
   timing.tempo_http = msSince(tHttp);
   if (httpHit) {
     timing.metodo = 'http_sessao';
@@ -531,6 +534,11 @@ async function scrapeRemuneracoesOnce({
     timing,
     metodo: 'puppeteer_apex'
   };
+}
+
+/** Página APEX ativa (após bootstrap) — para HTTP via browser. */
+export function getRemPageAtiva() {
+  return remPage;
 }
 
 /**
