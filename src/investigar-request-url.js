@@ -144,16 +144,33 @@ async function executarConsultaApex(page, opts, ajaxCapturas) {
     el.click();
   });
 
-  await page.waitForFunction(
-    (id, token) => {
-      const v = apex.item(id).getValue();
-      if (!v || !String(v).trim()) return false;
-      return String(v).trim() !== token;
-    },
-    { timeout: timeoutMs, polling: 300 },
-    IDS.resultadoRem,
-    token
-  );
+  try {
+    await page.waitForFunction(
+      (id, token) => {
+        const v = apex.item(id).getValue();
+        if (!v || !String(v).trim()) return false;
+        return String(v).trim() !== token;
+      },
+      { timeout: timeoutMs, polling: 300 },
+      IDS.resultadoRem,
+      token
+    );
+  } catch (err) {
+    return {
+      prefixo: nome,
+      tempo_apex_ms: Date.now() - t0,
+      erro: err.message,
+      timeout: true,
+      ajax_respostas: ajaxCapturas.map((a) => ({
+        url_mascarada: mascararUrl(a.url)?.mascarada || a.url,
+        status_http: a.status,
+        tempo_ms: a.tempo_ms,
+        content_type: a.content_type,
+        tamanho_bytes: a.tamanho_bytes,
+        itens: a.itens
+      }))
+    };
+  }
 
   const { raw, requestUrl } = await page.evaluate(
     (ids) => ({
@@ -281,9 +298,21 @@ export async function executarInvestigacaoRequestUrl(opts = {}) {
     await page.evaluate((regionSel) => {
       const reg = document.querySelector(regionSel);
       if (!reg || !reg.classList.contains('is-collapsed')) return;
-      reg.querySelector('button.t-Button--hideShow')?.click();
+      const openBtn =
+        reg.querySelector('button.t-Button--hideShow[aria-expanded="false"]') ||
+        reg.querySelector('button.t-Button--hideShow') ||
+        reg.querySelector('.t-Button--hideShow');
+      openBtn?.click();
     }, IDS.regionRem);
-    await sleep(400);
+    await page.waitForFunction(
+      (regionSel) => {
+        const reg = document.querySelector(regionSel);
+        return !!reg && !reg.classList.contains('is-collapsed');
+      },
+      { timeout: 10000 },
+      IDS.regionRem
+    );
+    await sleep(300);
 
     relatorio.bootstrap = {
       tempo_ms: Date.now() - tBoot,
@@ -292,12 +321,16 @@ export async function executarInvestigacaoRequestUrl(opts = {}) {
     };
 
     for (const prefixo of prefixos) {
-      const consulta = await executarConsultaApex(
-        page,
-        { competencia, codigoInstituicao, codigoOrgao, nomeServidor: prefixo, quantidade, timeoutMs },
-        ajaxCapturas
-      );
-      relatorio.consultas.push(consulta);
+      try {
+        const consulta = await executarConsultaApex(
+          page,
+          { competencia, codigoInstituicao, codigoOrgao, nomeServidor: prefixo, quantidade, timeoutMs },
+          ajaxCapturas
+        );
+        relatorio.consultas.push(consulta);
+      } catch (e) {
+        relatorio.consultas.push({ prefixo, erro: e.message });
+      }
       await sleep(500);
     }
 

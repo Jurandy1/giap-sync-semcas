@@ -86,7 +86,7 @@ app.post('/debug/investigar-request-url', async (req, res) => {
     const relatorio = await executarInvestigacaoRequestUrlEFechar({
       competencia,
       prefixos,
-      timeoutMs: Number(req.body.timeoutMs || 120000)
+      timeoutMs: Number(req.body.timeoutMs || 180000)
     });
     res.json(relatorio);
   } catch (e) {
