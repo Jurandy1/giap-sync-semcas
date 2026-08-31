@@ -7,6 +7,7 @@ import {
   avaliarMatch,
   deveGravarMatch,
   cruzarComIndice,
+  matchPendenteNoIndice,
   GiapBulkIndex,
   GiapSearchCache,
   criarStatsBusca,
@@ -15,6 +16,7 @@ import {
   CLASSIFICACAO,
   matKey
 } from './matching.js';
+import { normalizarRespostaLista } from './utils.js';
 import {
   estrategiasComHistorico,
   medirCoberturaHistorico,
@@ -111,6 +113,43 @@ export async function processarPendentesInteligente({
     const usaHistorico = historicoEhConfiavel(pendente.historico);
     const estrategias = estrategiasComHistorico(pendente, pendente.historico);
 
+    // Reutiliza índice bulk/histórico antes de chamar GIAP
+    const localPre = matchPendenteNoIndice(pendente, indice, {
+      matsCedidos,
+      cedidosIds: cedencias.ids,
+      ehCedido
+    });
+    if (localPre?.classificacao === CLASSIFICACAO.DIVERGENCIA) {
+      stats.divergencias++;
+      divergencias.push({ pendente, item: localPre.item, avaliacao: localPre.avaliacao, estrategia: 'indice_local' });
+      stats.sem_match++;
+      continue;
+    }
+    if (localPre && deveGravarMatch(localPre.avaliacao)) {
+      const reg = transformar({ ...localPre.item, competencia });
+      const { inseridos, registros } = await upsertRegistrosFolha([reg]);
+      if (inseridos > 0) {
+        stats.matches_nome++;
+        stats.resultados_por_bulk++;
+        stats.chamadas_giap_evitadas++;
+        stats.chamadas_giap_evitadas_matching_local++;
+        if (usaHistorico) stats.chamadas_giap_evitadas_historico++;
+        if (localPre.avaliacao.classificacao === CLASSIFICACAO.SEGURO) stats.matches_seguros++;
+        else stats.matches_provaveis++;
+        jobCache.marcarResolvido(pendente.funcionario_id);
+        metricas?.registrarUpsert(inseridos);
+        resultados.push({
+          pendente,
+          registros,
+          classificacao: localPre.classificacao,
+          avaliacao: localPre.avaliacao,
+          via: 'indice_local',
+          estrategia: 'indice_local'
+        });
+        continue;
+      }
+    }
+
     let matchFinal = null;
     let avalFinal = null;
     let melhorDivergencia = null;
@@ -126,7 +165,12 @@ export async function processarPendentesInteligente({
       let duracaoMs = 0;
 
       if (cacheHit) {
-        data = cacheHit.data || [];
+        data = cacheHit.data;
+        if (!Array.isArray(data)) {
+          const norm = normalizarRespostaLista(data);
+          if (norm.erro) throw new Error(norm.erro);
+          data = norm.lista;
+        }
         duracaoMs = cacheHit.duracao_ms || 0;
         stats.chamadas_giap_evitadas++;
         if (usaHistorico) stats.chamadas_giap_evitadas_historico++;
@@ -144,7 +188,9 @@ export async function processarPendentesInteligente({
               }),
             `sync_nome_${estrategia}`
           );
-          data = r.data || [];
+          const norm = normalizarRespostaLista(r.data, { requestUrl: r.requestUrl, rawPrefix: r.raw });
+          if (norm.erro) throw new Error(norm.erro);
+          data = norm.lista;
           duracaoMs = Date.now() - t1;
           jobCache.set(estrategia, { data, duracao_ms: duracaoMs });
           scrapesNome++;

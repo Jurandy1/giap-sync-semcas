@@ -218,8 +218,17 @@ app.post('/verificar/exoneracoes', async (req, res) => {
 app.get('/orgaos', async (req, res) => {
   try {
     const codigoInstituicao = Number(req.query.codigoInstituicao || 1);
-    const { data } = await scrapeOrgaos({ codigoInstituicao });
-    res.json({ codigoInstituicao, count: data.length, data });
+    const { data, responseMeta, raw } = await scrapeOrgaos({ codigoInstituicao });
+    res.json({
+      codigoInstituicao,
+      request_url: 'https://saoluis.giap.com.br/ords/saoluis/f?p=1618:6',
+      response_shape: responseMeta?.shape,
+      keys: responseMeta?.keys,
+      has_items: responseMeta?.has_items,
+      has_data: responseMeta?.has_data,
+      count: data.length,
+      data
+    });
   } catch (e) {
     console.error('[/orgaos]', e);
     res.status(500).json({ error: e.message });

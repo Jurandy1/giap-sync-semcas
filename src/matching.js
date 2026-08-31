@@ -12,7 +12,8 @@ import {
   nomeCasaPermissivo,
   similaridadeNome,
   parseDataBR,
-  SUFIXOS_IGNORADOS
+  SUFIXOS_IGNORADOS,
+  normalizarRespostaLista
 } from './utils.js';
 
 const CODIGO_ORGAO_SEMCAS = process.env.GIAP_CODIGO_ORGAO || '9';
@@ -94,20 +95,35 @@ export function estrategiasBuscaProgressiva(nome, max = null) {
   return out.slice(0, limite);
 }
 
-/** Prefixos de 2 tokens — prioriza nome GIAP histórico quando existir. */
-export function prefixosBuscaPendentes(pendentes, max = null) {
+/** Prefixos globais deduplicados — 1 consulta GIAP por prefixo único, prioriza cobertura. */
+export function prefixosGlobaisDedup(pendentes, max = null) {
   const lim = max ?? Math.max(5, Number(process.env.GIAP_BULK_PREFIXOS_MAX || 15));
-  const set = new Set();
+  const freq = new Map();
+
+  const add = (prefix) => {
+    const v = String(prefix || '').trim().toUpperCase();
+    if (v.length >= 3) freq.set(v, (freq.get(v) || 0) + 1);
+  };
+
   for (const p of pendentes || []) {
     const nomeBase = p.historico?.funcionario || p.nome;
     const sig = tokensSignificativos(nomeBase);
     if (sig.length >= 2) {
-      set.add([sig[0], sig[1]].join(' '));
-      set.add([sig[0], sig[sig.length - 1]].join(' '));
-      if (sig.length >= 3) set.add(sig.slice(0, 3).join(' '));
+      add([sig[0], sig[1]].join(' '));
+      add([sig[0], sig[sig.length - 1]].join(' '));
+      if (sig.length >= 3) add(sig.slice(0, 3).join(' '));
     }
   }
-  return [...set].slice(0, lim);
+
+  return [...freq.entries()]
+    .sort((a, b) => b[1] - a[1] || b[0].length - a[0].length)
+    .map(([prefix]) => prefix)
+    .slice(0, lim);
+}
+
+/** @deprecated alias — use prefixosGlobaisDedup */
+export function prefixosBuscaPendentes(pendentes, max = null) {
+  return prefixosGlobaisDedup(pendentes, max);
 }
 
 export function matKey(m) {
@@ -360,7 +376,11 @@ export class GiapBulkIndex {
   }
 
   addItems(data, fonte = 'bulk') {
-    for (const raw of data || []) {
+    const { lista, erro } = normalizarRespostaLista(data);
+    if (erro) {
+      throw new Error(`GiapBulkIndex.addItems: ${erro}`);
+    }
+    for (const raw of lista) {
       if (!raw) continue;
       const item = { ...raw, _fonte: fonte };
       const k = `${matKey(item.matricula)}|${normalizarNomeGiap(item.funcionario)}`;
@@ -443,6 +463,39 @@ export function letrasNecessariasPendentes(pendentes) {
   return [...letras].sort();
 }
 
+export function matchPendenteNoIndice(pendente, indice, opts = {}) {
+  const matsCedidos = opts.matsCedidos || new Set();
+  const cedidosIds = opts.cedidosIds || new Set();
+  const ehCedido =
+    opts.ehCedido ||
+    cedidosIds.has(pendente.funcionario_id) ||
+    (pendente.matricula && matsCedidos.has(matKey(pendente.matricula)));
+
+  const candidatos = indice.candidatosPara(pendente);
+  if (!candidatos.length) return null;
+
+  let melhor = null;
+  let melhorAval = null;
+  for (const cand of candidatos) {
+    const av = avaliarMatch(pendente, cand, { matsCedidos, cedidosIds, ehCedido });
+    const prio = {
+      [CLASSIFICACAO.SEGURO]: 4,
+      [CLASSIFICACAO.PROVAVEL]: 3,
+      [CLASSIFICACAO.DIVERGENCIA]: 2,
+      [CLASSIFICACAO.SEM_MATCH]: 1
+    };
+    const cur = prio[av.classificacao] || 0;
+    const best = melhorAval ? prio[melhorAval.classificacao] || 0 : 0;
+    if (cur > best || (cur === best && (av.sim || 0) > (melhorAval?.sim || 0))) {
+      melhor = cand;
+      melhorAval = av;
+    }
+  }
+
+  if (!melhor || !melhorAval) return null;
+  return { item: melhor, avaliacao: melhorAval, classificacao: melhorAval.classificacao };
+}
+
 export function cruzarComIndice(pendentes, indice, opts = {}) {
   const matsCedidos = opts.matsCedidos || new Set();
   const cedidosIds = opts.cedidosIds || new Set();
@@ -518,6 +571,19 @@ export function criarStatsBusca() {
     total_pendentes: 0,
     bulk_bruto: 0,
     bulk_util: 0,
+    registros_giap: 0,
+    registros_indexados: 0,
+    matches_rh: 0,
+    registros_importados: 0,
+    orgao_bruto: 0,
+    orgao_SEMCAS: 0,
+    orgao_matches_rh: 0,
+    orgao_matches_matricula: 0,
+    orgao_matches_nome: 0,
+    orgao_recebidos: 0,
+    orgao_descartados: 0,
+    orgao_inseridos: 0,
+    tempo_orgao_ms: 0,
     bulk_matches: 0,
     bulk_inseridos: 0,
     pendentes_iniciais: 0,

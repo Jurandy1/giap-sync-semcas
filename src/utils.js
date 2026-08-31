@@ -214,3 +214,102 @@ export function validarCompetencia(c) {
   const mes = n % 100;
   return ano >= 2000 && ano <= 2100 && mes >= 1 && mes <= 12;
 }
+
+/**
+ * Inspeciona shape de resposta GIAP (sem CPF).
+ * @returns {{ shape: string, keys: string[], count: number|null, has_items: boolean, has_data: boolean, erro?: string }}
+ */
+export function inspecionarShapeResposta(raw) {
+  if (raw == null) {
+    return { shape: 'null', keys: [], count: 0, has_items: false, has_data: false };
+  }
+  if (Array.isArray(raw)) {
+    return {
+      shape: 'array',
+      keys: [],
+      count: raw.length,
+      has_items: false,
+      has_data: false
+    };
+  }
+  if (typeof raw === 'object') {
+    const keys = Object.keys(raw);
+    return {
+      shape: 'object',
+      keys,
+      count: Array.isArray(raw.items)
+        ? raw.items.length
+        : Array.isArray(raw.data)
+          ? raw.data.length
+          : null,
+      has_items: Array.isArray(raw.items),
+      has_data: Array.isArray(raw.data)
+    };
+  }
+  return {
+    shape: typeof raw,
+    keys: [],
+    count: null,
+    has_items: false,
+    has_data: false,
+    erro: `tipo_inesperado:${typeof raw}`
+  };
+}
+
+/**
+ * Normaliza resposta GIAP em lista de registros.
+ * Aceita apenas formatos conhecidos — não usa (data || []) como fallback cego.
+ *
+ * @returns {{ lista: object[], meta: object, erro?: string }}
+ */
+export function normalizarRespostaLista(raw, ctx = {}) {
+  const meta = {
+    ...inspecionarShapeResposta(raw),
+    raw_prefix: ctx.rawPrefix ? String(ctx.rawPrefix).slice(0, 300) : undefined,
+    request_url: ctx.requestUrl || undefined
+  };
+
+  if (raw == null) {
+    return { lista: [], meta };
+  }
+
+  if (Array.isArray(raw)) {
+    meta.count = raw.length;
+    meta.shape = 'array';
+    return { lista: raw, meta };
+  }
+
+  if (typeof raw === 'object') {
+    if (Array.isArray(raw.items)) {
+      meta.shape = '{items:[]}';
+      meta.count = raw.items.length;
+      return { lista: raw.items, meta };
+    }
+    if (Array.isArray(raw.data)) {
+      meta.shape = '{data:[]}';
+      meta.count = raw.data.length;
+      return { lista: raw.data, meta };
+    }
+    if (raw.matricula != null || raw.funcionario) {
+      meta.shape = 'single_record';
+      meta.count = 1;
+      return { lista: [raw], meta };
+    }
+    const msg = `Formato GIAP inesperado: keys=[${Object.keys(raw).join(',')}]`;
+    meta.erro = msg;
+    return { lista: [], meta, erro: msg };
+  }
+
+  const msg = `Formato GIAP inesperado: tipo=${typeof raw}`;
+  meta.erro = msg;
+  return { lista: [], meta, erro: msg };
+}
+
+/** Garante array antes de iterar — lança se formato inválido. */
+export function asListaGiap(raw, ctx = {}) {
+  const { lista, meta, erro } = normalizarRespostaLista(raw, ctx);
+  if (erro && raw != null && !Array.isArray(raw)) {
+    throw new Error(erro);
+  }
+  return { lista, meta };
+}

@@ -6,7 +6,8 @@ import {
   similaridadeNome,
   nomeCasaPermissivo,
   nomeBuscaGiap,
-  variantesBuscaGiap
+  variantesBuscaGiap,
+  normalizarRespostaLista
 } from './utils.js';
 import {
   matKey,
@@ -112,35 +113,82 @@ export async function upsertRegistrosFolha(registros) {
 }
 
 /**
- * Puxa todos servidores de um órgão e faz upsert em folha_pmsl.
+ * Puxa remunerações em massa (sem filtro de órgão no portal).
+ * @param {'indexar'|'persistir'} modo — indexar: só retorna bruto; persistir: upsert SEMCAS (API /sync/orgao).
  */
-export async function syncPorOrgao({ codigoOrgao, codigoInstituicao = 1, competencia }) {
+export async function syncPorOrgao({
+  codigoOrgao,
+  codigoInstituicao = 1,
+  competencia,
+  modo = 'persistir'
+} = {}) {
   const inicio = Date.now();
   const log = {
     tipo: 'orgao',
-    parametros: { codigoOrgao, codigoInstituicao, competencia },
-    registros_encontrados: 0, // bruto do portal
-    registros_filtrados: 0,   // após filtro pós-scrape por codigo_orgao
-    registros_inseridos: 0
+    parametros: { codigoOrgao, codigoInstituicao, competencia, modo },
+    registros_giap: 0,
+    registros_encontrados: 0,
+    registros_filtrados: 0,
+    registros_inseridos: 0,
+    registros_descartados: 0
   };
 
   try {
-    // Portal zera resposta quando codigo_orgao é enviado — filtramos pós-scrape.
-    const { data, requestUrl } = await scrapeRemuneracoes({
+    const { data, requestUrl, responseMeta, raw } = await scrapeRemuneracoes({
       competencia,
       codigoInstituicao,
       quantidade: 100
     });
 
-    log.registros_encontrados = data.length;
+    const { lista, meta, erro } = normalizarRespostaLista(data, {
+      requestUrl,
+      rawPrefix: raw
+    });
+
+    if (erro) {
+      throw new Error(erro);
+    }
+
+    log.registros_giap = lista.length;
+    log.registros_encontrados = lista.length;
     log.parametros.request_url = requestUrl;
-    log.data_bruta = data.length;
+    log.response_meta = responseMeta || meta;
+    log.response_shape = meta?.shape;
+
+    console.log(
+      JSON.stringify({
+        evento: 'giap_sync_orgao_resposta',
+        competencia,
+        request_url: requestUrl,
+        status: 'ok',
+        content_type: 'json',
+        response_shape: meta?.shape,
+        keys: meta?.keys,
+        has_items: meta?.has_items,
+        has_data: meta?.has_data,
+        registros_giap: lista.length
+      })
+    );
+
+    if (modo === 'indexar') {
+      log.duracao_ms = Date.now() - inicio;
+      await logSync(log);
+      return {
+        success: true,
+        modo: 'indexar',
+        data_bruta: lista,
+        registros_giap: lista.length,
+        request_url: requestUrl,
+        response_meta: meta,
+        ...log
+      };
+    }
 
     const filtradas = codigoOrgao
-      ? data.filter((r) => String(r.codigo_orgao) === String(codigoOrgao))
-      : data;
+      ? lista.filter((r) => String(r.codigo_orgao) === String(codigoOrgao))
+      : lista;
     log.registros_filtrados = filtradas.length;
-    log.registros_descartados = data.length - filtradas.length;
+    log.registros_descartados = lista.length - filtradas.length;
 
     if (filtradas.length > 0) {
       const registros = dedupePorChave(
@@ -155,7 +203,15 @@ export async function syncPorOrgao({ codigoOrgao, codigoInstituicao = 1, compete
 
     log.duracao_ms = Date.now() - inicio;
     await logSync(log);
-    return { success: true, data_bruta: data, ...log };
+    return {
+      success: true,
+      modo: 'persistir',
+      data_bruta: lista,
+      registros_giap: lista.length,
+      request_url: requestUrl,
+      response_meta: meta,
+      ...log
+    };
   } catch (e) {
     log.erro = e.message;
     log.duracao_ms = Date.now() - inicio;
@@ -173,7 +229,8 @@ export async function syncPorPrefixoBulk({
   competencia,
   codigoOrgao = CODIGO_ORGAO_SEMCAS,
   matsCedidos = [],
-  codigoInstituicao = 1
+  codigoInstituicao = 1,
+  modo = 'persistir'
 } = {}) {
   const termo = String(prefixo || letra || '')
     .trim()
@@ -188,19 +245,37 @@ export async function syncPorPrefixoBulk({
   };
 
   try {
-    const { data, requestUrl } = await scrapeRemuneracoes({
+    const { data, requestUrl, responseMeta, raw } = await scrapeRemuneracoes({
       competencia,
       codigoInstituicao,
       nomeServidor: termo,
       quantidade: 100
     });
 
-    log.registros_encontrados = data.length;
-    log.parametros.request_url = requestUrl;
+    const { lista, meta, erro } = normalizarRespostaLista(data, { requestUrl, rawPrefix: raw });
+    if (erro) throw new Error(erro);
 
-    const filtradas = filtrarBulkFolha(data, matsCedidos);
+    log.registros_giap = lista.length;
+    log.registros_encontrados = lista.length;
+    log.parametros.request_url = requestUrl;
+    log.response_shape = meta?.shape;
+
+    if (modo === 'indexar') {
+      log.duracao_ms = Date.now() - inicio;
+      await logSync(log);
+      return {
+        success: true,
+        modo: 'indexar',
+        data_bruta: lista,
+        registros_giap: lista.length,
+        response_meta: meta,
+        ...log
+      };
+    }
+
+    const filtradas = filtrarBulkFolha(lista, matsCedidos);
     log.registros_filtrados = filtradas.length;
-    log.registros_descartados = data.length - filtradas.length;
+    log.registros_descartados = lista.length - filtradas.length;
 
     if (filtradas.length > 0) {
       const registros = dedupePorChave(
@@ -214,7 +289,7 @@ export async function syncPorPrefixoBulk({
 
     log.duracao_ms = Date.now() - inicio;
     await logSync(log);
-    return { success: true, data_bruta: data, ...log };
+    return { success: true, data_bruta: lista, registros_giap: lista.length, response_meta: meta, ...log };
   } catch (e) {
     log.erro = e.message;
     log.duracao_ms = Date.now() - inicio;
@@ -312,7 +387,9 @@ export async function syncPorNome({
         nomeServidor: busca,
         quantidade: qtd
       });
-      data = r.data || [];
+      const norm = normalizarRespostaLista(r.data, { requestUrl: r.requestUrl, rawPrefix: r.raw });
+      if (norm.erro) throw new Error(norm.erro);
+      data = norm.lista;
       requestUrl = r.requestUrl;
       raw = r.raw || '';
       if (data.length > 0) break;

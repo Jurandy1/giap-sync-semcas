@@ -20,8 +20,13 @@ import {
 import { competenciaAtual } from './utils.js';
 import { closeBrowser } from './scraper.js';
 
-/** Limite de buscas por nome por execução (Render free 512MB). */
-const MAX_BUSCAS_NOME = Math.max(0, Number(process.env.GIAP_MAX_BUSCAS_NOME || 3));
+/** Candidatos preparados por job (scrapes permanecem sequenciais — 1 Chrome ativo). */
+const CANDIDATOS_POR_JOB = Math.max(1, Number(process.env.GIAP_CANDIDATOS_POR_JOB || 50));
+/** Limite efetivo de buscas por nome por execução. */
+const MAX_BUSCAS_NOME = Math.max(
+  0,
+  Number(process.env.GIAP_MAX_BUSCAS_NOME ?? CANDIDATOS_POR_JOB)
+);
 /** No free tier: 1 = só nome completo (evita 5 scrapes/pessoa). */
 const MAX_VARIANTES_NOME = Math.max(1, Number(process.env.GIAP_MAX_VARIANTES_NOME || 1));
 /** Fecha o Chrome a cada N pessoas (libera RAM). */
@@ -552,9 +557,9 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao, filt
 
         syncRes = {
           success: true,
-          registros_encontrados: bulkRes.orgao?.registros_encontrados || 0,
-          registros_filtrados: bulkRes.orgao?.registros_filtrados || 0,
-          registros_inseridos: bulkRes.orgao?.registros_inseridos || 0,
+          registros_encontrados: bulkRes.stats?.orgao_bruto || bulkRes.orgao?.registros_giap || 0,
+          registros_filtrados: bulkRes.stats?.orgao_SEMCAS || 0,
+          registros_inseridos: bulkRes.stats?.registros_importados || bulkRes.stats?.orgao_inseridos || 0,
           pulou_orgao: false,
           folha_antes: folhaAntes,
           bulk: bulkRes
@@ -705,10 +710,25 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao, filt
       };
 
       resumo.sync = {
-        orgao_bruto: syncRes.registros_encontrados,
+        candidatos_por_job: MAX_BUSCAS_NOME,
+        orgao_bruto: bulkRes?.stats?.orgao_bruto ?? syncRes.registros_encontrados,
+        orgao_SEMCAS: bulkRes?.stats?.orgao_SEMCAS ?? 0,
+        orgao_matches_rh: bulkRes?.stats?.orgao_matches_rh ?? 0,
+        orgao_matches_matricula: bulkRes?.stats?.orgao_matches_matricula ?? 0,
+        orgao_matches_nome: bulkRes?.stats?.orgao_matches_nome ?? 0,
+        orgao_recebidos: bulkRes?.stats?.orgao_recebidos ?? 0,
+        orgao_descartados: bulkRes?.stats?.orgao_descartados ?? 0,
+        orgao_inseridos: bulkRes?.stats?.orgao_inseridos ?? syncRes.registros_inseridos,
+        tempo_orgao_ms: bulkRes?.stats?.tempo_orgao_ms ?? 0,
+        registros_giap: bulkRes?.stats?.registros_giap ?? syncRes.registros_encontrados,
+        registros_indexados: bulkRes?.stats?.registros_indexados ?? bulkRes?.indice?.size ?? 0,
+        matches_rh: bulkRes?.stats?.matches_rh ?? 0,
+        registros_importados: bulkRes?.stats?.registros_importados ?? syncRes.registros_inseridos,
         orgao_filtrado: syncRes.registros_filtrados,
         orgao_encontrados: syncRes.registros_filtrados,
-        orgao_inseridos: syncRes.registros_inseridos,
+        orgao_request_url: bulkRes?.orgao?.request_url,
+        orgao_response_shape: bulkRes?.orgao?.response_shape,
+        orgao_erro: bulkRes?.orgao?.erro,
         encontrados: syncRes.registros_filtrados,
         inseridos: syncRes.registros_inseridos,
         extras_letras: extras,

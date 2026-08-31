@@ -11,8 +11,13 @@ import {
   GiapBulkIndex,
   cruzarComIndice,
   letrasNecessariasPendentes,
-  prefixosBuscaPendentes,
-  criarStatsBusca
+  prefixosGlobaisDedup,
+  criarStatsBusca,
+  ehFolhaSemcas,
+  matLiberada,
+  matKey,
+  CLASSIFICACAO,
+  deveGravarMatch
 } from './matching.js';
 
 const CODIGO_ORGAO_SEMCAS = process.env.GIAP_CODIGO_ORGAO || '9';
@@ -38,7 +43,29 @@ export async function contarFolhaBulk(competencia, codigoOrgao = CODIGO_ORGAO_SE
   return count || 0;
 }
 
-async function aplicarCruzamento(restantes, indice, matsSet, cedencias, competencia, stats, resultado) {
+function medirBrutoOrgao(bruto, matsSet) {
+  let semcas = 0;
+  let recebidos = 0;
+  for (const item of bruto) {
+    if (ehFolhaSemcas(item)) semcas++;
+    if (matLiberada(matsSet, item.matricula)) recebidos++;
+  }
+  return {
+    orgao_bruto: bruto.length,
+    orgao_SEMCAS: semcas,
+    orgao_recebidos: recebidos,
+    orgao_outros: bruto.length - semcas
+  };
+}
+
+function classificarMatchOrgao(avaliacao) {
+  const fatores = avaliacao?.fatores || [];
+  if (fatores.some((f) => f.includes('matricula'))) return 'matricula';
+  if (fatores.some((f) => f.includes('cpf'))) return 'cpf';
+  return 'nome';
+}
+
+async function aplicarCruzamento(restantes, indice, matsSet, cedencias, competencia, stats, resultado, ctx = {}) {
   if (!restantes.length) return restantes;
 
   const cruz = cruzarComIndice(restantes, indice, {
@@ -50,15 +77,35 @@ async function aplicarCruzamento(restantes, indice, matsSet, cedencias, competen
   stats.matches_seguros += cruz.stats.matches_seguros;
   stats.matches_provaveis += cruz.stats.matches_provaveis;
   stats.chamadas_giap_evitadas += cruz.stats.chamadas_giap_evitadas;
+  stats.chamadas_giap_evitadas_matching_local += cruz.stats.chamadas_giap_evitadas;
+  stats.matches_rh += cruz.matches.length;
 
   for (const m of cruz.matches) {
+    if (ctx.orgao) {
+      stats.orgao_matches_rh++;
+      const tipo = classificarMatchOrgao(m.score);
+      if (tipo === 'matricula') stats.orgao_matches_matricula++;
+      else if (tipo === 'cpf') stats.orgao_matches_matricula++;
+      else stats.orgao_matches_nome++;
+      if (m.pendente.eh_cedido) stats.orgao_recebidos++;
+    }
+
+    if (m.pendente.eh_cedido || m.pendente.grupo_historico === 'D') stats.cedidos_processados++;
     const reg = transformar({ ...m.item, competencia });
     const { inseridos } = await upsertRegistrosFolha([reg]);
     if (inseridos > 0) {
       resultado.bulk_matches++;
       stats.bulk_matches++;
+      stats.registros_importados += inseridos;
       stats.bulk_inseridos += inseridos;
+      if (ctx.orgao) stats.orgao_inseridos += inseridos;
+      if (ctx.prefixo) stats.resultados_por_prefixo++;
+      else stats.resultados_por_bulk++;
     }
+  }
+
+  if (ctx.orgao) {
+    stats.orgao_descartados = Math.max(0, stats.orgao_bruto - stats.orgao_matches_rh);
   }
 
   return cruz.restantes;
@@ -118,7 +165,7 @@ export async function executarFaseBulk({
 
   let restantes = [...pendentes];
 
-  // 1) Órgão — indexa bruto completo
+  // 1) Órgão — indexa bruto completo (sem filtrar antes do matching)
   if (onProgress) await onProgress({ etapa: 'bulk_orgao', folha_antes: folhaAntes });
   const t0 = Date.now();
   try {
@@ -127,16 +174,34 @@ export async function executarFaseBulk({
         syncPorOrgao({
           codigoOrgao: String(codigoOrgao),
           codigoInstituicao: 1,
-          competencia
+          competencia,
+          modo: 'indexar'
         }),
       'bulk_sync_orgao'
     );
-    const bruto = resultado.orgao?.data_bruta || [];
+
+    const bruto = Array.isArray(resultado.orgao?.data_bruta) ? resultado.orgao.data_bruta : [];
+    const medOrgao = medirBrutoOrgao(bruto, matsSet);
+    Object.assign(stats, medOrgao);
+    stats.registros_giap += bruto.length;
     stats.bulk_bruto += bruto.length;
+
     indice.addItems(bruto, 'orgao');
+    stats.registros_indexados = indice.size;
+
     metricas?.registrarScrape('orgao', Date.now() - t0);
-    metricas?.registrarUpsert(resultado.orgao?.registros_inseridos || 0);
-    stats.bulk_inseridos += resultado.orgao?.registros_inseridos || 0;
+    stats.tempo_orgao_ms = Date.now() - t0;
+
+    console.log(
+      JSON.stringify({
+        evento: 'giap_bulk_orgao',
+        competencia,
+        request_url: resultado.orgao?.request_url,
+        response_shape: resultado.orgao?.response_shape,
+        ...medOrgao,
+        registros_indexados: indice.size
+      })
+    );
 
     restantes = await aplicarCruzamento(
       restantes,
@@ -145,11 +210,16 @@ export async function executarFaseBulk({
       cedencias,
       competencia,
       stats,
-      resultado
+      resultado,
+      { orgao: true }
     );
   } catch (e) {
     metricas?.registrarErro();
-    resultado.orgao = { erro: e.message, success: false };
+    resultado.orgao = {
+      erro: e.message,
+      success: false,
+      response_meta: e.response_meta || null
+    };
     console.warn('[bulk] sync orgao falhou:', e.message);
     await closeBrowser().catch(() => {});
   }
@@ -159,7 +229,7 @@ export async function executarFaseBulk({
   // 2) Prefixos derivados dos pendentes (padrão — mais eficiente que A–Z)
   const prefixos =
     restantes.length >= MIN_PENDENTES_BULK_EXTRA
-      ? prefixosBuscaPendentes(restantes)
+      ? prefixosGlobaisDedup(restantes)
       : [];
 
   for (const prefixo of prefixos) {
@@ -176,21 +246,22 @@ export async function executarFaseBulk({
             prefixo,
             competencia,
             codigoOrgao: String(codigoOrgao),
-            matsCedidos
+            matsCedidos,
+            modo: 'indexar'
           }),
         `bulk_prefixo_${prefixo}`
       );
-      const bruto = r.data_bruta || [];
+      const bruto = Array.isArray(r.data_bruta) ? r.data_bruta : [];
       detalhe.bruto = bruto.length;
+      detalhe.registros_giap = r.registros_giap || bruto.length;
       detalhe.filtrados = r.registros_filtrados || 0;
       detalhe.descartados = r.registros_descartados || 0;
-      detalhe.inseridos = r.registros_inseridos || 0;
+      detalhe.inseridos_direto = r.registros_inseridos || 0;
       indice.addItems(bruto, `prefixo:${prefixo}`);
+      stats.registros_giap += bruto.length;
       stats.bulk_bruto += bruto.length;
-      stats.bulk_inseridos += r.registros_inseridos || 0;
+      stats.registros_indexados = indice.size;
       metricas?.registrarScrape('letra', Date.now() - t1);
-      metricas?.registrarUpsert(r.registros_inseridos || 0);
-      resultado.prefixos.inseridos += r.registros_inseridos || 0;
       resultado.prefixos.feitos++;
 
       const antes = restantes.length;
@@ -201,9 +272,11 @@ export async function executarFaseBulk({
         cedencias,
         competencia,
         stats,
-        resultado
+        resultado,
+        { prefixo: true }
       );
       detalhe.matches_local = antes - restantes.length;
+      detalhe.inseridos = detalhe.matches_local;
     } catch (e) {
       detalhe.erro = e.message;
       metricas?.registrarErro();
@@ -238,19 +311,18 @@ export async function executarFaseBulk({
             prefixo: letra,
             competencia,
             codigoOrgao: String(codigoOrgao),
-            matsCedidos
+            matsCedidos,
+            modo: 'indexar'
           }),
         `bulk_letra_${letra}`
       );
-      const bruto = r.data_bruta || [];
+      const bruto = Array.isArray(r.data_bruta) ? r.data_bruta : [];
       detalhe.bruto = bruto.length;
-      detalhe.filtrados = r.registros_filtrados || 0;
-      detalhe.descartados = r.registros_descartados || 0;
-      detalhe.inseridos = r.registros_inseridos || 0;
       indice.addItems(bruto, `letra:${letra}`);
+      stats.registros_giap += bruto.length;
       stats.bulk_bruto += bruto.length;
+      stats.registros_indexados = indice.size;
       metricas?.registrarScrape('letra', Date.now() - t1);
-      resultado.letras.inseridos += r.registros_inseridos || 0;
       resultado.letras.feitas++;
 
       const antes = restantes.length;
@@ -264,6 +336,7 @@ export async function executarFaseBulk({
         resultado
       );
       detalhe.matches_local = antes - restantes.length;
+      detalhe.inseridos = detalhe.matches_local;
     } catch (e) {
       resultado.letras.erros++;
       detalhe.erro = e.message;

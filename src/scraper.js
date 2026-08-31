@@ -1,6 +1,7 @@
 import puppeteer from 'puppeteer';
 import fs from 'fs';
 import path from 'path';
+import { normalizarRespostaLista, inspecionarShapeResposta } from './utils.js';
 
 const PORTAL_URL = 'https://saoluis.giap.com.br/ords/saoluis/f?p=1618:6';
 
@@ -385,7 +386,8 @@ async function scrapeRemuneracoesOnce({
     IDS
   );
 
-  return { data: parseResult(raw), requestUrl, raw };
+  const parsed = parseResult(raw, { requestUrl });
+  return { data: parsed.lista, responseMeta: parsed.meta, requestUrl, raw };
 }
 
 /**
@@ -478,21 +480,61 @@ export async function scrapeOrgaos({
     );
 
     const raw = await page.evaluate((ids) => apex.item(ids.resultadoOrgao).getValue(), IDS);
-    return { data: parseResult(raw), raw };
+    const parsed = parseResult(raw, { endpoint: 'orgaos' });
+    console.log(
+      JSON.stringify({
+        evento: 'giap_scrape_orgaos_shape',
+        response_shape: parsed.meta?.shape,
+        keys: parsed.meta?.keys,
+        has_items: parsed.meta?.has_items,
+        has_data: parsed.meta?.has_data,
+        count: parsed.meta?.count,
+        erro: parsed.meta?.erro || parsed.erro || null
+      })
+    );
+    return { data: parsed.lista, responseMeta: parsed.meta, raw };
   } finally {
     await page.close().catch(() => {});
   }
 }
 
-function parseResult(raw) {
-  if (!raw) return [];
+function parseResult(raw, ctx = {}) {
+  if (!raw) {
+    return {
+      lista: [],
+      meta: inspecionarShapeResposta(null),
+      erro: null
+    };
+  }
   const clean = String(raw).replace(/^Resultado\s*/i, '').trim();
+  let parsed;
   try {
-    const parsed = JSON.parse(clean);
-    return Array.isArray(parsed) ? parsed : [parsed];
+    parsed = JSON.parse(clean);
   } catch (e) {
     console.error('[scraper] JSON parse failed:', e.message);
     console.error('[scraper] raw prefix:', clean.substring(0, 300));
-    return [];
+    return {
+      lista: [],
+      meta: {
+        ...inspecionarShapeResposta(null),
+        parse_error: e.message,
+        raw_prefix: clean.substring(0, 300),
+        endpoint: ctx.endpoint
+      },
+      erro: `json_parse_failed: ${e.message}`
+    };
   }
+
+  const norm = normalizarRespostaLista(parsed, {
+    rawPrefix: clean,
+    requestUrl: ctx.requestUrl,
+    endpoint: ctx.endpoint
+  });
+
+  if (norm.erro) {
+    console.error('[scraper] formato inesperado:', norm.erro);
+    console.error('[scraper] shape:', JSON.stringify(norm.meta));
+  }
+
+  return norm;
 }
