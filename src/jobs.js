@@ -4,6 +4,8 @@
 import { syncPorOrgao, syncPorNome } from './sync.js';
 import { executarFaseBulk, contarFolhaBulk, GIAP_BULK_META } from './bulk.js';
 import { criarMetricas, memoriaPressionada } from './metrics.js';
+import { processarPendentesInteligente } from './busca-inteligente.js';
+import { GiapSearchCache } from './matching.js';
 import {
   enriquecerFuncionarios,
   aplicarExoneracoes,
@@ -493,9 +495,23 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao, filt
       let letrasFeitas = 0;
       let pulouLetras = true;
       let pulouBulk = false;
+      let todasPendentes = [];
+      const pularBuscasNome = filtros?.pularBuscasNome === true;
+      const jobCache = filtros._cache_busca ? null : new GiapSearchCache();
 
-      // Fase bulk: órgão + A–Z somente no 1º lote e se folha < GIAP_BULK_META
-      if (isPrimeiroLote && folhaAntes < GIAP_BULK_META) {
+      if (!pularBuscasNome) {
+        try {
+          todasPendentes = await listarBuscasNomePendentes(competencia);
+          if (!filtros._total_inicial && todasPendentes.length) {
+            filtros._total_inicial = todasPendentes.length;
+          }
+        } catch (e) {
+          console.warn('[jobs] listar pendentes antes do bulk:', e.message);
+        }
+      }
+
+      // Fase bulk: órgão + A–Z adaptativo no 1º lote e se folha < GIAP_BULK_META
+      if (isPrimeiroLote && folhaAntes < GIAP_BULK_META && !pularBuscasNome) {
         await updateJob(jobId, {
           progresso_pct: 2,
           resumo: {
@@ -509,6 +525,7 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao, filt
         bulkRes = await executarFaseBulk({
           competencia,
           codigoOrgao: String(codigoOrgao),
+          pendentes: todasPendentes,
           metricas,
           comTimeout,
           watchdogMs: SCRAPE_WATCHDOG_MS,
@@ -533,6 +550,10 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao, filt
         letrasFeitas = bulkRes.letras?.feitas || 0;
         pulouLetras = false;
         folhaAntes = bulkRes.folha_depois ?? folhaAntes;
+        // Recarrega pendentes após bulk + matching local
+        try {
+          todasPendentes = await listarBuscasNomePendentes(competencia);
+        } catch (_) { /* ok */ }
       } else {
         pulouBulk = true;
         const motivo = isPrimeiroLote
@@ -546,184 +567,96 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao, filt
 
       // Mantém a mesma aba do Chrome para as buscas por nome (sem closeBrowser aqui)
 
-      let extrasNomes = 0;
-      let nomesEncontrados = 0;
-      let nomesVazios = 0;
-      let nomesScrapeVazio = 0;
-      let nomesRejeitadosFiltro = 0;
-      let nomesSemMatricula = 0;
-      let nomesEncontradosReais = 0;
-      let scrapesNome = 0;
       let buscasNome = [];
       let buscasPendentes = 0;
-      let totalPendentesInicial = 0;
-      const pularBuscasNome = filtros?.pularBuscasNome === true;
+      let totalPendentesInicial = Number(filtros._total_inicial || todasPendentes.length || 0);
+      let buscaInteligenteRes = null;
       verificadosNome = new Set();
       matriculasBusca = new Map();
-      try {
-        if (pularBuscasNome) {
-          // Snapshot de auditoria: só órgão (+ letras se pedidas). Sem fila de 900 nomes.
-          buscasNome = [];
-          buscasPendentes = 0;
-        } else {
-          let todas = await listarBuscasNomePendentes(competencia);
-          if (!filtros._total_inicial && todas.length) {
-            filtros._total_inicial = todas.length;
-          }
-          totalPendentesInicial = Number(filtros._total_inicial || todas.length);
-          metricas.setTotalServidores(totalPendentesInicial);
-          metricas.setPendentes(todas.length, true);
-          // Sempre TODOS os elegíveis que ainda não estão na folha
-          // (com/sem matrícula ou admissão — listarBuscasNomePendentes já exclui Terceirizado/PROCAD).
-          todas.sort((a, b) => {
-            return (
-              (b.variantes?.[0] || b.busca || '').split(' ').length -
-              (a.variantes?.[0] || a.busca || '').split(' ').length
-            );
-          });
-          buscasPendentes = Math.max(0, todas.length - MAX_BUSCAS_NOME);
-          buscasNome = todas.slice(0, MAX_BUSCAS_NOME);
-          const lotesRestantes = Math.ceil(buscasPendentes / Math.max(1, MAX_BUSCAS_NOME));
-          metricas.setLote(cadeiaAtual + 1, lotesRestantes);
-          metricas.setPendentes(buscasPendentes);
-        }
-      } catch (err) {
-        console.warn('[jobs] listar buscas nome', err.message);
+
+      if (!pularBuscasNome) {
+        todasPendentes.sort((a, b) => {
+          const ga = a.tem_matricula ? 0 : 1;
+          const gb = b.tem_matricula ? 0 : 1;
+          if (ga !== gb) return ga - gb;
+          return (
+            (b.variantes?.[0] || b.busca || '').split(' ').length -
+            (a.variantes?.[0] || a.busca || '').split(' ').length
+          );
+        });
+        totalPendentesInicial = Number(filtros._total_inicial || todasPendentes.length);
+        metricas.setTotalServidores(totalPendentesInicial);
+        buscasPendentes = Math.max(0, todasPendentes.length - MAX_BUSCAS_NOME);
+        buscasNome = todasPendentes.slice(0, MAX_BUSCAS_NOME);
+        const lotesRestantes = Math.ceil(buscasPendentes / Math.max(1, MAX_BUSCAS_NOME));
+        metricas.setLote(cadeiaAtual + 1, lotesRestantes);
+        metricas.setPendentes(buscasPendentes);
       }
+
       const debugNomes = [];
       let cedencias = { ids: new Set(), mats: new Set() };
       try {
         cedencias = await carregarCedenciasAtuais();
       } catch (_) { /* ok */ }
 
-      for (let i = 0; i < buscasNome.length; i++) {
-        if (memoriaPressionada()) {
-          console.warn('[jobs] pressão de memória — fecha Chrome antes do nome', i + 1);
-          await closeBrowser().catch(() => {});
-        }
-
-        const item = buscasNome[i];
-        // Free tier: só 1ª variante (nome completo). Prefixo sobra p/ "Puxar na API".
-        const variantesRaw = (item.variantes && item.variantes.length)
-          ? item.variantes
-          : [item.busca].filter(Boolean);
-        const variantes = variantesRaw.slice(0, MAX_VARIANTES_NOME);
-        const ehCedido =
-          cedencias.ids.has(item.funcionario_id) ||
-          (item.matricula && cedencias.mats.has(String(item.matricula).trim()));
-        let bruto = 0;
-        let posFiltro = 0;
-        let inseridos = 0;
-        let linhasInseridas = [];
-        let ultimaResposta = null;
-        let ultimaBusca = null;
-        let ultimaDuracao = 0;
-        let ultimosNomesRetornados = null;
-        try {
-          for (const busca of variantes) {
-            scrapesNome++;
-            ultimaBusca = busca;
-            const tNome = Date.now();
-            const r = await comTimeout(
-              syncPorNome({
-                nomeServidor: busca,
-                codigoInstituicao: 1,
-                competencia,
-                filtrarNomeAlvo: item.nome,
-                // Com matrícula do RH: libera essa mat mesmo fora do órgão 9.
-                // Sem matrícula: só SEMCAS (homônimos de outras secs ficam de fora).
-                apenasSemcas: true,
-                matriculasOutrosOrgaosOk: item.matricula
-                  ? [String(item.matricula).trim()]
-                  : (ehCedido ? [...cedencias.mats] : [])
-              }),
-              SCRAPE_WATCHDOG_MS,
-              `sync_nome_${busca}`
-            );
-            metricas.registrarScrape('nome', Date.now() - tNome);
-            metricas.registrarUpsert(r.registros_inseridos || 0);
-            bruto = r.registros_encontrados || 0;
-            posFiltro = r.registros_filtrados || 0;
-            inseridos = r.registros_inseridos || 0;
-            if (inseridos > 0) linhasInseridas = r.resultado || [];
-            ultimaResposta = r.raw_amostra;
-            ultimaDuracao = r.duracao_ms || 0;
-            if (r.nomes_retornados_amostra) {
-              ultimosNomesRetornados = r.nomes_retornados_amostra;
-            }
-            // Só para quando a PESSOA foi achada (pós-filtro) — homônimo
-            // bruto não conta; senão "MARIA LIMA" impedia de tentar "AMPARO"
-            if (posFiltro > 0) break;
-          }
-          // Todas as variantes rodaram sem erro — ausência verificável
-          verificadosNome.add(item.funcionario_id);
-          // Matrícula única achada p/ quem estava sem — o enriquecer usa o link
-          if (inseridos > 0 && !item.tem_matricula) {
-            const mats = [
-              ...new Set(
-                linhasInseridas.map((x) => String(x.matricula ?? '').trim()).filter(Boolean)
-              )
-            ];
-            if (mats.length === 1) matriculasBusca.set(item.funcionario_id, mats[0]);
-          }
-          extrasNomes += inseridos;
-          if (inseridos > 0) {
-            nomesEncontrados++;
-            nomesEncontradosReais++;
-          } else {
-            nomesVazios++;
-            if (bruto === 0) nomesScrapeVazio++;
-            else if (posFiltro === 0) nomesRejeitadosFiltro++;
-            else nomesSemMatricula++;
-          }
-          if (inseridos === 0 && debugNomes.length < 3) {
-            debugNomes.push({
-              nome_rh: item.nome,
-              variantes_tentadas: variantes,
-              ultima_busca: ultimaBusca,
-              bruto,
-              pos_filtro: posFiltro,
-              duracao_ms: ultimaDuracao,
-              raw_amostra: ultimaResposta,
-              nomes_retornados_amostra: ultimosNomesRetornados
+      if (!pularBuscasNome && buscasNome.length) {
+        buscaInteligenteRes = await processarPendentesInteligente({
+          pendentes: buscasNome,
+          competencia,
+          bulkIndex: bulkRes?.indice || null,
+          cache: jobCache,
+          cedencias,
+          codigoOrgao: String(codigoOrgao),
+          maxBuscas: MAX_BUSCAS_NOME,
+          comTimeout,
+          watchdogMs: SCRAPE_WATCHDOG_MS,
+          metricas,
+          onProgress: async ({ i, total, nome }) => {
+            await updateJob(jobId, {
+              progresso_pct: Math.round(18 + (i / Math.max(total, 1)) * 12),
+              processados: i,
+              total,
+              resumo: {
+                ...resumo,
+                etapa: `sync_nome_inteligente_${i}/${total}`,
+                nome_atual: nome
+              }
             });
-          }
-        } catch (err) {
-          nomesVazios++;
-          nomesScrapeVazio++;
-          metricas.registrarErro();
-          console.warn('[jobs] sync nome', ultimaBusca || item.busca, err.message);
-          if (String(err.message).startsWith('watchdog:')) {
-            await closeBrowser().catch(() => {});
-          }
-          if (debugNomes.length < 3) {
-            debugNomes.push({
-              nome_rh: item.nome,
-              variantes_tentadas: variantes,
-              ultima_busca: ultimaBusca,
-              erro: err.message
-            });
-          }
-        }
-
-        // Libera RAM do Chrome com frequência (plano free 512MB)
-        if ((i + 1) % CLOSE_BROWSER_EVERY_NOME === 0) {
-          await closeBrowser().catch(() => {});
-        }
-
-        await updateJob(jobId, {
-          progresso_pct: Math.round(
-            18 + ((i + 1) / Math.max(buscasNome.length, 1)) * 12
-          ),
-          processados: i + 1,
-          total: buscasNome.length,
-          resumo: {
-            ...resumo,
-            etapa: `sync_nome_${i + 1}/${buscasNome.length}`,
-            max_buscas: MAX_BUSCAS_NOME,
-            max_variantes: MAX_VARIANTES_NOME
           }
         });
+
+        for (const r of buscaInteligenteRes.resultados || []) {
+          verificadosNome.add(r.pendente.funcionario_id);
+          if (!r.pendente.tem_matricula && r.registros?.length === 1) {
+            const mat = String(r.registros[0].matricula ?? '').trim();
+            if (mat) matriculasBusca.set(r.pendente.funcionario_id, mat);
+          }
+        }
+        if (buscaInteligenteRes.debug_nomes?.length) {
+          debugNomes.push(...buscaInteligenteRes.debug_nomes);
+        }
+      }
+
+      const extrasNomes = buscaInteligenteRes?.nomes_encontrados || 0;
+      const nomesEncontrados = extrasNomes;
+      const nomesEncontradosReais = extrasNomes;
+      const nomesVazios = buscaInteligenteRes?.nomes_vazios || 0;
+      const nomesScrapeVazio = nomesVazios;
+      const nomesRejeitadosFiltro = buscaInteligenteRes?.nomes_rejeitados || 0;
+      const nomesSemMatricula = 0;
+      const scrapesNome = buscaInteligenteRes?.scrapes_nome || 0;
+
+      if (scrapesNome > 0 && scrapesNome % CLOSE_BROWSER_EVERY_NOME === 0) {
+        await closeBrowser().catch(() => {});
+      }
+
+      // Recalcula pendentes reais após bulk + busca inteligente
+      if (!pularBuscasNome) {
+        try {
+          const ainda = await listarBuscasNomePendentes(competencia);
+          buscasPendentes = Math.max(0, ainda.length);
+          metricas.setPendentes(buscasPendentes);
+        } catch (_) { /* ok */ }
       }
 
       // Fecha Chrome antes do enriquecimento (só Node + Supabase)
@@ -735,9 +668,16 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao, filt
         0,
         totalPendentesInicial - buscasPendentes
       );
+
       const lotesRestantesFim = Math.ceil(
         buscasPendentes / Math.max(1, MAX_BUSCAS_NOME)
       );
+
+      const matchingStats = {
+        ...(bulkRes?.stats || {}),
+        ...(buscaInteligenteRes?.stats || {}),
+        estrategias_resumo: buscaInteligenteRes?.stats?.estrategias_resumo || []
+      };
 
       resumo.sync = {
         orgao_bruto: syncRes.registros_encontrados,
@@ -769,7 +709,8 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao, filt
         scrapes_nome: scrapesNome,
         debug_nomes: debugNomes,
         success: syncRes.success,
-        bulk: bulkRes || undefined
+        bulk: bulkRes || undefined,
+        matching: matchingStats
       };
       resumo.progresso = {
         bulk_registros: bulkRegistros,

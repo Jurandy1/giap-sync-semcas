@@ -8,36 +8,19 @@ import {
   nomeBuscaGiap,
   variantesBuscaGiap
 } from './utils.js';
+import {
+  matKey,
+  ehFolhaSemcas,
+  matLiberada,
+  elegivelParaFolha,
+  estrategiasBuscaProgressiva
+} from './matching.js';
 import { getSupabase } from './supabase.js';
 
 const CODIGO_ORGAO_SEMCAS = process.env.GIAP_CODIGO_ORGAO || '9';
-const LOTACAO_SEMCAS = 'SEMCAS';
 
 function sb() {
   return getSupabase();
-}
-
-function ehFolhaSemcas(item) {
-  return (
-    String(item?.lotacao || '')
-      .toUpperCase()
-      .trim() === LOTACAO_SEMCAS ||
-    String(item?.codigo_orgao ?? '') === String(CODIGO_ORGAO_SEMCAS)
-  );
-}
-
-function matKey(m) {
-  if (m == null || m === '') return '';
-  const digits = String(m).replace(/\D/g, '');
-  const s = digits || String(m).trim();
-  const stripped = s.replace(/^0+/, '');
-  return stripped || '0';
-}
-
-function matLiberada(matsOk, matricula) {
-  if (!matsOk?.size) return false;
-  const k = matKey(matricula);
-  return !!(k && matsOk.has(k));
 }
 
 /** Filtro bulk: SEMCAS ou matrícula liberada (cedidos/recebidos). */
@@ -45,15 +28,15 @@ function filtrarBulkFolha(data, matsCedidos = []) {
   const matsOk = new Set(
     [...matsCedidos].map((m) => matKey(m)).filter(Boolean)
   );
-  return data.filter(
-    (item) => ehFolhaSemcas(item) || matLiberada(matsOk, item.matricula)
-  );
+  return data.filter((item) => elegivelParaFolha(item, matsOk));
 }
+
+export { matKey, ehFolhaSemcas, matLiberada };
 
 /**
  * Converte item bruto do GIAP no formato da tabela folha_pmsl.
  */
-function transformar(item) {
+export function transformar(item) {
   return {
     competencia: item.competencia,
     codigo_instituicao: item.codigo_instituicao,
@@ -116,6 +99,18 @@ function dedupePorChave(registros) {
   return [...m.values()];
 }
 
+/** Upsert em lote idempotente em folha_pmsl. */
+export async function upsertRegistrosFolha(registros) {
+  const deduped = dedupePorChave((registros || []).filter((r) => r.matricula));
+  if (!deduped.length) return { inseridos: 0, registros: [] };
+  const { error, data } = await sb()
+    .from('folha_pmsl')
+    .upsert(deduped, { onConflict: 'competencia,matricula,codigo_instituicao' })
+    .select('id, matricula, funcionario, cpf, lotacao');
+  if (error) throw error;
+  return { inseridos: data?.length || 0, registros: data || [] };
+}
+
 /**
  * Puxa todos servidores de um órgão e faz upsert em folha_pmsl.
  */
@@ -139,11 +134,13 @@ export async function syncPorOrgao({ codigoOrgao, codigoInstituicao = 1, compete
 
     log.registros_encontrados = data.length;
     log.parametros.request_url = requestUrl;
+    log.data_bruta = data.length;
 
     const filtradas = codigoOrgao
       ? data.filter((r) => String(r.codigo_orgao) === String(codigoOrgao))
       : data;
     log.registros_filtrados = filtradas.length;
+    log.registros_descartados = data.length - filtradas.length;
 
     if (filtradas.length > 0) {
       const registros = dedupePorChave(
@@ -151,21 +148,14 @@ export async function syncPorOrgao({ codigoOrgao, codigoInstituicao = 1, compete
       );
 
       if (registros.length > 0) {
-        const { error, data: inseridos } = await sb()
-          .from('folha_pmsl')
-          .upsert(registros, {
-            onConflict: 'competencia,matricula,codigo_instituicao'
-          })
-          .select('id');
-
-        if (error) throw error;
-        log.registros_inseridos = inseridos?.length || 0;
+        const { inseridos } = await upsertRegistrosFolha(registros);
+        log.registros_inseridos = inseridos;
       }
     }
 
     log.duracao_ms = Date.now() - inicio;
     await logSync(log);
-    return { success: true, ...log };
+    return { success: true, data_bruta: data, ...log };
   } catch (e) {
     log.erro = e.message;
     log.duracao_ms = Date.now() - inicio;
@@ -203,29 +193,26 @@ export async function syncPorLetraBulk({
 
     log.registros_encontrados = data.length;
     log.parametros.request_url = requestUrl;
+    log.letra = letra;
 
     const filtradas = filtrarBulkFolha(data, matsCedidos);
     log.registros_filtrados = filtradas.length;
+    log.registros_descartados = data.length - filtradas.length;
+    log.registros_apos_normalizacao = data.length;
 
     if (filtradas.length > 0) {
       const registros = dedupePorChave(
         filtradas.map(transformar).filter((r) => r.matricula)
       );
       if (registros.length > 0) {
-        const { error, data: inseridos } = await sb()
-          .from('folha_pmsl')
-          .upsert(registros, {
-            onConflict: 'competencia,matricula,codigo_instituicao'
-          })
-          .select('id');
-        if (error) throw error;
-        log.registros_inseridos = inseridos?.length || 0;
+        const { inseridos } = await upsertRegistrosFolha(registros);
+        log.registros_inseridos = inseridos;
       }
     }
 
     log.duracao_ms = Date.now() - inicio;
     await logSync(log);
-    return { success: true, ...log };
+    return { success: true, data_bruta: data, ...log };
   } catch (e) {
     log.erro = e.message;
     log.duracao_ms = Date.now() - inicio;
@@ -299,13 +286,12 @@ export async function syncPorNome({
       const v = nomeBuscaGiap(s) || (normalizarNome(s) || '').trim();
       if (v && !variantes.includes(v)) variantes.push(v);
     };
-    addVar(nomeServidor);
-    for (const v of variantesBuscaGiap(nomeServidor)) addVar(v);
-    // Sem JUNIOR/JR no fim (às vezes o portal indexa sem sufixo)
-    const tokens = (nomeBuscaGiap(nomeServidor) || '').split(' ').filter(Boolean);
-    if (tokens.length >= 3) {
-      const semSufixo = tokens.filter((t) => t !== 'JUNIOR' && t !== 'JR');
-      if (semSufixo.length >= 2) addVar(semSufixo.join(' '));
+    for (const v of estrategiasBuscaProgressiva(nomeServidor || filtrarNomeAlvo || '')) {
+      addVar(v);
+    }
+    if (!variantes.length) {
+      addVar(nomeServidor);
+      for (const v of variantesBuscaGiap(nomeServidor)) addVar(v);
     }
 
     let data = [];

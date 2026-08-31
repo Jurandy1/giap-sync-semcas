@@ -16,6 +16,7 @@ import {
   variantesBuscaGiap,
   variantesBuscaSemMatricula
 } from './utils.js';
+import { estrategiasBuscaProgressiva } from './matching.js';
 import { getSupabase } from './supabase.js';
 
 const CODIGO_ORGAO_SEMCAS = process.env.GIAP_CODIGO_ORGAO || '9';
@@ -612,9 +613,7 @@ export async function listarBuscasNomePendentes(competencia) {
     if (!nn || nomesFolha.has(nn)) continue;
     if (tokensLen(hr.nome) < 2) continue;
 
-    const variantes = !temMatricula
-      ? variantesBuscaSemMatricula(hr.nome) // completo → prefixos longos (≥2 tokens)
-      : variantesBuscaGiap(hr.nome);
+    const variantes = estrategiasBuscaProgressiva(hr.nome);
     if (!variantes.length) continue;
 
     // Dedup por nome normalizado (não pela 1ª variante)
