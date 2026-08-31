@@ -165,19 +165,23 @@ export async function syncPorOrgao({ codigoOrgao, codigoInstituicao = 1, compete
 }
 
 /**
- * Varredura A–Z em bulk: 1 scrape por letra, filtra SEMCAS + cedidos/recebidos.
+ * Busca bulk por prefixo (letra única ou 2+ tokens).
  */
-export async function syncPorLetraBulk({
+export async function syncPorPrefixoBulk({
+  prefixo,
   letra,
   competencia,
   codigoOrgao = CODIGO_ORGAO_SEMCAS,
   matsCedidos = [],
   codigoInstituicao = 1
 } = {}) {
+  const termo = String(prefixo || letra || '')
+    .trim()
+    .toUpperCase();
   const inicio = Date.now();
   const log = {
-    tipo: 'letra_bulk',
-    parametros: { letra, competencia, codigoOrgao, mats_cedidos: matsCedidos.length },
+    tipo: 'prefixo_bulk',
+    parametros: { prefixo: termo, competencia, codigoOrgao, mats_cedidos: matsCedidos.length },
     registros_encontrados: 0,
     registros_filtrados: 0,
     registros_inseridos: 0
@@ -187,18 +191,16 @@ export async function syncPorLetraBulk({
     const { data, requestUrl } = await scrapeRemuneracoes({
       competencia,
       codigoInstituicao,
-      nomeServidor: String(letra || '').trim().toUpperCase().slice(0, 1),
+      nomeServidor: termo,
       quantidade: 100
     });
 
     log.registros_encontrados = data.length;
     log.parametros.request_url = requestUrl;
-    log.letra = letra;
 
     const filtradas = filtrarBulkFolha(data, matsCedidos);
     log.registros_filtrados = filtradas.length;
     log.registros_descartados = data.length - filtradas.length;
-    log.registros_apos_normalizacao = data.length;
 
     if (filtradas.length > 0) {
       const registros = dedupePorChave(
@@ -219,6 +221,11 @@ export async function syncPorLetraBulk({
     await logSync(log);
     throw e;
   }
+}
+
+/** @deprecated use syncPorPrefixoBulk */
+export async function syncPorLetraBulk(opts = {}) {
+  return syncPorPrefixoBulk(opts);
 }
 
 /**

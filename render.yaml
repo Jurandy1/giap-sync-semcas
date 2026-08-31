@@ -18,7 +18,7 @@ services:
       - key: GIAP_MAX_BUSCAS_NOME
         value: "3"
       - key: GIAP_MAX_VARIANTES_NOME
-        value: "1"
+        value: "4"
       # Reusa o Chromium por várias buscas — corta o boot de ~8-15s por scrape.
       # Se voltar a OOMar, reduza para 1 (design de checkpoint garante retomada).
       - key: GIAP_BROWSER_RESTART_EVERY
@@ -27,6 +27,10 @@ services:
         value: "5"
       - key: GIAP_BULK_META
         value: "400"
+      - key: GIAP_BULK_AZ
+        value: "0"
+      - key: GIAP_BULK_PREFIXOS_MAX
+        value: "15"
       - key: GIAP_AUTO_CONTINUAR
         value: "1"
       - key: GIAP_CONTINUAR_DELAY_MS

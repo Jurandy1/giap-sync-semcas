@@ -11,6 +11,7 @@
  */
 import {
   normalizarNome,
+  normalizarCPF,
   similaridadeNome,
   nomeBuscaGiap,
   variantesBuscaGiap,
@@ -596,7 +597,7 @@ export async function listarBuscasNomePendentes(competencia) {
   const funcs = await selectTudo(() =>
     sb()
       .from('funcionarios')
-      .select('id, nome, matricula, data_admissao')
+      .select('id, nome, matricula, cpf, data_admissao')
       .eq('ativo', true)
       .order('id')
   );
@@ -624,6 +625,7 @@ export async function listarBuscasNomePendentes(competencia) {
       funcionario_id: hr.id,
       nome: hr.nome,
       matricula: temMatricula ? String(hr.matricula).trim() : null,
+      cpf: hr.cpf ? normalizarCPF(hr.cpf) : null,
       tem_matricula: temMatricula,
       busca: variantes[0],
       variantes,

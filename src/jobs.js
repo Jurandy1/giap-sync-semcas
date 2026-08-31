@@ -642,7 +642,7 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao, filt
       const nomesEncontradosReais = extrasNomes;
       const nomesVazios = buscaInteligenteRes?.nomes_vazios || 0;
       const nomesScrapeVazio = nomesVazios;
-      const nomesRejeitadosFiltro = buscaInteligenteRes?.nomes_rejeitados || 0;
+      const nomesRejeitadosFiltro = buscaInteligenteRes?.stats?.divergencias || 0;
       const nomesSemMatricula = 0;
       const scrapesNome = buscaInteligenteRes?.scrapes_nome || 0;
 
@@ -676,6 +676,7 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao, filt
       const matchingStats = {
         ...(bulkRes?.stats || {}),
         ...(buscaInteligenteRes?.stats || {}),
+        divergencias_detalhe: buscaInteligenteRes?.divergencias?.slice(0, 10) || [],
         estrategias_resumo: buscaInteligenteRes?.stats?.estrategias_resumo || []
       };
 

@@ -1,14 +1,8 @@
 /**
  * Motor de matching RH ↔ GIAP.
+ * Busca agressiva + associação conservadora.
  *
- * Comportamento do portal (evidência em scraper + teste-limite.mjs):
- * - P6_NOME_SERVIDOR: busca por PREFIXO (startsWith / LIKE 'termo%'), não igualdade.
- * - Nome em MAIÚSCULAS; acentos removidos no envio.
- * - quantidade limita a ~100 registros por consulta.
- * - Nome vazio retorna lote geral (usado no sync órgão).
- * - codigo_orgao no request zera resposta — filtro é pós-scrape.
- * - Sem resultado: JSON [] ou timeout → { data: [], raw: '' }.
- * - Nomes muito longos costumam retornar vazio; prefixos curtos (2+ tokens) funcionam melhor.
+ * GIAP: busca por PREFIXO (startsWith); nomes longos podem retornar [].
  */
 import {
   normalizarNome,
@@ -23,23 +17,26 @@ import {
 
 const CODIGO_ORGAO_SEMCAS = process.env.GIAP_CODIGO_ORGAO || '9';
 const LOTACAO_SEMCAS = 'SEMCAS';
-
 const PARTICULAS = new Set(['DE', 'DA', 'DO', 'DAS', 'DOS', 'E', 'DI', 'DU']);
 
-/** Normalização única RH + GIAP (acentos, maiúsculas, espaços, JR/JUNIOR). */
+export const CLASSIFICACAO = {
+  SEGURO: 'MATCH_SEGURO',
+  PROVAVEL: 'MATCH_PROVAVEL',
+  DIVERGENCIA: 'DIVERGENCIA_CADASTRAL',
+  SEM_MATCH: 'SEM_MATCH'
+};
+
+export function maxVariantesNome() {
+  return Math.max(1, Number(process.env.GIAP_MAX_VARIANTES_NOME || 4));
+}
+
 export function normalizarNomeGiap(nome) {
   if (!nome) return null;
   let n = normalizarNome(nome);
   if (!n) return null;
-  n = n
-    .replace(/\bJUNIOR\b/g, 'JR')
-    .replace(/\bFILHO\b/g, 'FILHO')
-    .replace(/\s+/g, ' ')
-    .trim();
-  return n;
+  return n.replace(/\bJUNIOR\b/g, 'JR').replace(/\s+/g, ' ').trim();
 }
 
-/** Tokens significativos (sem partículas nem sufixos triviais). */
 export function tokensSignificativos(nome) {
   return fundirTokensCurtos(tokensNome(nome)).filter(
     (t) => !PARTICULAS.has(t) && !SUFIXOS_IGNORADOS.has(t)
@@ -47,39 +44,31 @@ export function tokensSignificativos(nome) {
 }
 
 /**
- * Estratégias de busca progressiva (mín. 2 tokens, exceto último recurso).
- * Ordem: completo → sem partículas → primeiro+último → primeiro+2 últimos → distintivo → combos.
+ * Estratégias progressivas para busca por prefixo no GIAP.
+ * Máximo configurável via GIAP_MAX_VARIANTES_NOME (padrão 4).
  */
-export function estrategiasBuscaProgressiva(nome) {
+export function estrategiasBuscaProgressiva(nome, max = null) {
+  const limite = max != null ? max : maxVariantesNome();
   const completo = fundirTokensCurtos(tokensNome(nome));
   const sig = tokensSignificativos(nome);
   if (!sig.length) return completo.length ? [completo.join(' ')] : [];
 
   const out = [];
   const addTokens = (arr, minTokens = 2) => {
-    if (!arr?.length) return;
-    if (arr.length < minTokens) return;
+    if (!arr?.length || arr.length < minTokens) return;
     const s = arr.join(' ').trim();
     if (s.length >= 3 && !out.includes(s)) out.push(s);
   };
 
-  // 1) Nome completo (com partículas)
   addTokens(completo, 2);
-  // 1b) Sem partículas
   addTokens(sig, 2);
 
   const first = sig[0];
   const last = sig[sig.length - 1];
 
-  // 2) Primeiro + último sobrenome
   addTokens([first, last], 2);
+  if (sig.length >= 3) addTokens([first, ...sig.slice(-2)], 3);
 
-  // 3) Primeiro + dois últimos
-  if (sig.length >= 3) {
-    addTokens([first, ...sig.slice(-2)], 3);
-  }
-
-  // 4) Primeiro + sobrenome mais distintivo (mais longo entre sobrenomes)
   const sobrenomes = sig.slice(1);
   if (sobrenomes.length) {
     const distintivo = [...sobrenomes].sort((a, b) => b.length - a.length)[0];
@@ -87,27 +76,37 @@ export function estrategiasBuscaProgressiva(nome) {
     if (distintivo !== last) addTokens([first, distintivo, last], 3);
   }
 
-  // 5) Combinações de 2–3 tokens distintivos
-  if (sig.length >= 3) {
+  if (sig.length >= 4) {
     addTokens([first, sig[1], last], 3);
-    addTokens(sig.slice(0, 3), 3);
-    if (sig.length >= 4) addTokens([first, ...sig.slice(-2)], 3);
-    addTokens([first, sig[Math.floor(sig.length / 2)], last], 3);
+    addTokens([first, ...sig.slice(-2)], 3);
   }
 
-  // Sem sufixo JR no fim
   const semJr = sig.filter((t) => t !== 'JR');
   if (semJr.length >= 2 && semJr.length !== sig.length) {
-    addTokens(semJr, 2);
     addTokens([semJr[0], semJr[semJr.length - 1]], 2);
   }
 
-  // Último recurso: só primeiro nome (≥5 chars) — GIAP prefixo
-  if (first.length >= 5 && !out.includes(first)) {
+  // Último recurso: primeiro nome (≥5 chars), nunca como 1ª tentativa
+  if (first.length >= 5 && out.length >= limite - 1 && !out.includes(first)) {
     out.push(first);
   }
 
-  return out.slice(0, 10);
+  return out.slice(0, limite);
+}
+
+/** Prefixos de 2 tokens derivados dos pendentes (substituto mais eficiente que A–Z). */
+export function prefixosBuscaPendentes(pendentes, max = null) {
+  const lim = max ?? Math.max(5, Number(process.env.GIAP_BULK_PREFIXOS_MAX || 15));
+  const set = new Set();
+  for (const p of pendentes || []) {
+    const sig = tokensSignificativos(p.nome);
+    if (sig.length >= 2) {
+      set.add([sig[0], sig[1]].join(' '));
+      set.add([sig[0], sig[sig.length - 1]].join(' '));
+      if (sig.length >= 3) set.add(sig.slice(0, 3).join(' '));
+    }
+  }
+  return [...set].slice(0, lim);
 }
 
 export function matKey(m) {
@@ -120,9 +119,7 @@ export function matKey(m) {
 
 export function ehFolhaSemcas(item) {
   return (
-    String(item?.lotacao || '')
-      .toUpperCase()
-      .trim() === LOTACAO_SEMCAS ||
+    String(item?.lotacao || '').toUpperCase().trim() === LOTACAO_SEMCAS ||
     String(item?.codigo_orgao ?? '') === String(CODIGO_ORGAO_SEMCAS)
   );
 }
@@ -133,137 +130,179 @@ export function matLiberada(matsOk, matricula) {
   return !!(k && matsOk.has(k));
 }
 
-/** Elegível para folha_pmsl: SEMCAS ou matrícula de cedido/recebido. */
 export function elegivelParaFolha(item, matsCedidos = new Set()) {
   return ehFolhaSemcas(item) || matLiberada(matsCedidos, item.matricula);
 }
 
+function admissaoCompativel(pendente, itemGiap) {
+  if (!pendente.data_admissao || !itemGiap.admissao) return null;
+  const admRh = String(pendente.data_admissao).slice(0, 10);
+  const admGiap = parseDataBR(itemGiap.admissao) || String(itemGiap.admissao).slice(0, 10);
+  if (!admRh || !admGiap) return null;
+  return admRh === admGiap;
+}
+
 /**
- * Score de correspondência RH ↔ GIAP.
- * >= 90 seguro | >= 75 provável | < 75 rejeitar
+ * Avalia correspondência RH ↔ GIAP com hierarquia:
+ * matrícula → CPF → nome → dados auxiliares → similaridade.
  */
-export function calcularScoreMatch(pendente, itemGiap, opts = {}) {
+export function avaliarMatch(pendente, itemGiap, opts = {}) {
   const matsCedidos = opts.matsCedidos || new Set();
   const ehCedido =
     opts.ehCedido ||
     (pendente.funcionario_id && opts.cedidosIds?.has(pendente.funcionario_id)) ||
     (pendente.matricula && matsCedidos.has(matKey(pendente.matricula)));
 
+  const base = {
+    sim: 0,
+    casa: false,
+    fatores: [],
+    conflitos: [],
+    matRh: null,
+    matGiap: null
+  };
+
   if (!elegivelParaFolha(itemGiap, matsCedidos)) {
-    return {
-      score: 0,
-      nivel: 'rejeitado',
-      motivo: 'fora_semcas_cedidos',
-      sim: 0
-    };
+    return { ...base, classificacao: CLASSIFICACAO.SEM_MATCH, motivo: 'fora_semcas_cedidos' };
   }
 
   const nomeRh = pendente.nome;
-  const nomeGiap = itemGiap.funcionario || itemGiap.funcionario;
+  const nomeGiap = itemGiap.funcionario;
   const sim = similaridadeNome(nomeRh, nomeGiap);
   const casa = nomeCasaPermissivo(nomeRh, nomeGiap);
+  const nomeCompat = casa || sim >= 0.85;
 
-  let score = 0;
-  const fatores = [];
+  base.sim = sim;
+  base.casa = casa;
 
-  if (casa) {
-    score += 50;
-    fatores.push('nome_casa');
-  } else if (sim >= 0.92) {
-    score += 45;
-    fatores.push('nome_alta_sim');
-  } else if (sim >= 0.85) {
-    score += 35;
-    fatores.push('nome_boa_sim');
-  } else if (sim >= 0.75) {
-    score += 25;
-    fatores.push('nome_sim_moderada');
-  } else {
+  const matRh = pendente.matricula ? matKey(pendente.matricula) : null;
+  const matGiap = itemGiap.matricula ? matKey(itemGiap.matricula) : null;
+  base.matRh = matRh;
+  base.matGiap = matGiap;
+
+  const cpfRh = pendente.cpf ? normalizarCPF(pendente.cpf) : null;
+  const cpfGiap = itemGiap.cpf ? normalizarCPF(itemGiap.cpf) : null;
+
+  const admOk = admissaoCompativel(pendente, itemGiap);
+  const admConflito = admOk === false;
+
+  // Conflitos de identidade → divergência cadastral (não gravar)
+  if (matRh && matGiap && matRh !== matGiap) {
+    if (nomeCompat || casa) {
+      return {
+        ...base,
+        classificacao: CLASSIFICACAO.DIVERGENCIA,
+        motivo: 'matricula_divergente',
+        conflitos: ['matricula'],
+        fatores: ['nome_parecido', 'matricula_divergente']
+      };
+    }
+    return { ...base, classificacao: CLASSIFICACAO.SEM_MATCH, motivo: 'matricula_divergente' };
+  }
+
+  if (cpfRh && cpfGiap && cpfRh !== cpfGiap) {
+    if (nomeCompat || casa) {
+      return {
+        ...base,
+        classificacao: CLASSIFICACAO.DIVERGENCIA,
+        motivo: 'cpf_divergente',
+        conflitos: ['cpf'],
+        fatores: ['nome_parecido', 'cpf_divergente']
+      };
+    }
+    return { ...base, classificacao: CLASSIFICACAO.SEM_MATCH, motivo: 'cpf_divergente' };
+  }
+
+  if (admConflito && (casa || sim >= 0.88)) {
     return {
-      score: 0,
-      nivel: 'rejeitado',
-      motivo: 'nome_insuficiente',
-      sim,
+      ...base,
+      classificacao: CLASSIFICACAO.DIVERGENCIA,
+      motivo: 'admissao_divergente',
+      conflitos: ['admissao'],
+      fatores: ['nome_parecido', 'admissao_divergente']
+    };
+  }
+
+  // MATCH_SEGURO
+  if (matRh && matGiap && matRh === matGiap && (nomeCompat || ehCedido)) {
+    return {
+      ...base,
+      classificacao: CLASSIFICACAO.SEGURO,
+      motivo: 'matricula_confere',
+      fatores: ['matricula_ok', nomeCompat ? 'nome_compativel' : 'cedido'].filter(Boolean)
+    };
+  }
+
+  if (cpfRh && cpfGiap && cpfRh === cpfGiap && nomeCompat) {
+    return {
+      ...base,
+      classificacao: CLASSIFICACAO.SEGURO,
+      motivo: 'cpf_confere',
+      fatores: ['cpf_ok', 'nome_compativel']
+    };
+  }
+
+  if ((casa || sim >= 0.92) && !admConflito) {
+    const fatores = [casa ? 'nome_casa' : 'nome_alta_sim'];
+    if (admOk) fatores.push('admissao_ok');
+    if (ehCedido) fatores.push('cedido');
+    return {
+      ...base,
+      classificacao: CLASSIFICACAO.SEGURO,
+      motivo: 'nome_forte_auxiliares',
       fatores
     };
   }
 
-  const matRh = pendente.matricula ? matKey(pendente.matricula) : null;
-  const matGiap = itemGiap.matricula ? matKey(itemGiap.matricula) : null;
-
-  if (matRh && matGiap) {
-    if (matRh === matGiap) {
-      score += 30;
-      fatores.push('matricula_ok');
-    } else {
-      return {
-        score: 0,
-        nivel: 'rejeitado',
-        motivo: 'matricula_divergente',
-        sim,
-        fatores: ['matricula_divergente']
-      };
-    }
+  // MATCH_PROVAVEL — sem conflito, mas evidência mais fraca
+  if (nomeCompat && !admConflito) {
+    return {
+      ...base,
+      classificacao: CLASSIFICACAO.PROVAVEL,
+      motivo: 'nome_semelhante',
+      fatores: [casa ? 'nome_casa' : 'nome_sim', admOk ? 'admissao_ok' : null].filter(Boolean)
+    };
   }
 
-  const cpfRh = pendente.cpf ? normalizarCPF(pendente.cpf) : null;
-  const cpfGiap = itemGiap.cpf ? normalizarCPF(itemGiap.cpf) : null;
-  if (cpfRh && cpfGiap) {
-    if (cpfRh === cpfGiap) {
-      score += 15;
-      fatores.push('cpf_ok');
-    } else {
-      return {
-        score: 0,
-        nivel: 'rejeitado',
-        motivo: 'cpf_divergente',
-        sim,
-        fatores: ['cpf_divergente']
-      };
-    }
-  }
-
-  if (pendente.data_admissao && itemGiap.admissao) {
-    const admRh = String(pendente.data_admissao).slice(0, 10);
-    const admGiap = parseDataBR(itemGiap.admissao) || String(itemGiap.admissao).slice(0, 10);
-    if (admRh && admGiap && admRh === admGiap) {
-      score += 10;
-      fatores.push('admissao_ok');
-    }
-  }
-
-  const tr = tokensSignificativos(nomeRh);
-  const tg = tokensSignificativos(nomeGiap);
-  if (tr.length && tg.length && tr[tr.length - 1] === tg[tg.length - 1]) {
-    score += 5;
-    fatores.push('mesmo_ultimo_sobrenome');
-  }
-
-  if (ehCedido && matGiap && matRh && matRh === matGiap) {
-    score += 5;
-    fatores.push('cedido_mat_ok');
-  }
-
-  let nivel = 'rejeitado';
-  if (score >= 90) nivel = 'seguro';
-  else if (score >= 75) nivel = 'provavel';
-
-  return { score, nivel, sim, casa, fatores, matRh, matGiap };
+  return { ...base, classificacao: CLASSIFICACAO.SEM_MATCH, motivo: 'nome_insuficiente' };
 }
 
-/** Decide se grava em folha_pmsl automaticamente. */
-export function deveGravarMatch(resultadoScore, pendente) {
-  if (!resultadoScore || resultadoScore.nivel === 'rejeitado') return false;
-  if (resultadoScore.nivel === 'seguro') return true;
-  if (resultadoScore.nivel === 'provavel') {
-    // Provável só com matrícula confirmada ou nome quase idêntico
-    if (resultadoScore.fatores?.includes('matricula_ok')) return true;
-    if (resultadoScore.sim >= 0.92 && resultadoScore.casa) return true;
+/** Compat: score numérico derivado da classificação. */
+export function calcularScoreMatch(pendente, itemGiap, opts = {}) {
+  const r = avaliarMatch(pendente, itemGiap, opts);
+  const map = {
+    [CLASSIFICACAO.SEGURO]: 95,
+    [CLASSIFICACAO.PROVAVEL]: 78,
+    [CLASSIFICACAO.DIVERGENCIA]: 50,
+    [CLASSIFICACAO.SEM_MATCH]: 0
+  };
+  return {
+    ...r,
+    score: map[r.classificacao] ?? 0,
+    nivel:
+      r.classificacao === CLASSIFICACAO.SEGURO
+        ? 'seguro'
+        : r.classificacao === CLASSIFICACAO.PROVAVEL
+          ? 'provavel'
+          : 'rejeitado'
+  };
+}
+
+/** Grava em folha_pmsl somente associação conservadora. */
+export function deveGravarMatch(resultado) {
+  if (!resultado) return false;
+  const c = resultado.classificacao || resultado.nivel;
+  if (c === CLASSIFICACAO.SEGURO || c === 'seguro') return true;
+  if (c === CLASSIFICACAO.PROVAVEL || c === 'provavel') {
+    if (resultado.conflitos?.length) return false;
+    return (
+      resultado.fatores?.includes('matricula_ok') ||
+      resultado.fatores?.includes('cpf_ok')
+    );
   }
   return false;
 }
 
-/** Priorização A/B/C/D. */
 export function classificarPendentes(pendentes, cedencias = { ids: new Set(), mats: new Set() }) {
   const A = [];
   const B = [];
@@ -276,21 +315,15 @@ export function classificarPendentes(pendentes, cedencias = { ids: new Set(), ma
       (p.matricula && cedencias.mats.has(matKey(p.matricula)));
     const sig = tokensSignificativos(p.nome);
 
-    if (ehCedido) {
-      D.push({ ...p, grupo: 'D', eh_cedido: true });
-    } else if (p.tem_matricula && p.matricula) {
-      A.push({ ...p, grupo: 'A' });
-    } else if (sig.length >= 2) {
-      B.push({ ...p, grupo: 'B' });
-    } else {
-      C.push({ ...p, grupo: 'C' });
-    }
+    if (ehCedido) D.push({ ...p, grupo: 'D', eh_cedido: true });
+    else if (p.tem_matricula && p.matricula) A.push({ ...p, grupo: 'A' });
+    else if (sig.length >= 2) B.push({ ...p, grupo: 'B' });
+    else C.push({ ...p, grupo: 'C' });
   }
 
   return { A, B, C, D, ordem: [...A, ...B, ...D, ...C] };
 }
 
-/** Índice em memória dos registros brutos do bulk. */
 export class GiapBulkIndex {
   constructor() {
     this.itens = [];
@@ -334,13 +367,6 @@ export class GiapBulkIndex {
     if (ft) {
       for (const item of this.porPrimeiroToken.get(ft) || []) add(item);
     }
-    for (const item of this.itens) {
-      const nn = normalizarNomeGiap(item.funcionario);
-      const np = normalizarNomeGiap(pendente.nome);
-      if (nn && np && (nn.includes(np.split(' ')[0]) || np.includes(nn.split(' ')[0]))) {
-        add(item);
-      }
-    }
     return [...out.values()];
   }
 
@@ -349,16 +375,18 @@ export class GiapBulkIndex {
   }
 }
 
-/** Cache de buscas GIAP por termo (mesmo job). */
 export class GiapSearchCache {
   constructor() {
     this.porTermo = new Map();
     this.resolvidos = new Set();
+    this.hits = 0;
   }
 
   get(termo) {
     const k = normalizarNomeGiap(termo) || String(termo || '').trim().toUpperCase();
-    return this.porTermo.get(k) || null;
+    const hit = this.porTermo.get(k);
+    if (hit) this.hits++;
+    return hit || null;
   }
 
   set(termo, payload) {
@@ -375,7 +403,6 @@ export class GiapSearchCache {
   }
 }
 
-/** Letras iniciais necessárias a partir dos pendentes (evita 26 scrapes fixos). */
 export function letrasNecessariasPendentes(pendentes) {
   const letras = new Set();
   for (const p of pendentes || []) {
@@ -385,20 +412,19 @@ export function letrasNecessariasPendentes(pendentes) {
   return [...letras].sort();
 }
 
-/**
- * Cruza pendentes com índice bulk local (sem GIAP).
- * @returns {{ matches: Array, restantes: Array, stats: object }}
- */
 export function cruzarComIndice(pendentes, indice, opts = {}) {
   const matsCedidos = opts.matsCedidos || new Set();
   const cedidosIds = opts.cedidosIds || new Set();
   const matches = [];
+  const divergencias = [];
   const restantes = [];
   const stats = {
     tentativas: 0,
     matches_seguros: 0,
     matches_provaveis: 0,
-    rejeitados: 0
+    divergencias: 0,
+    sem_match: 0,
+    chamadas_giap_evitadas: pendentes.length
   };
 
   for (const pendente of pendentes) {
@@ -407,61 +433,79 @@ export function cruzarComIndice(pendentes, indice, opts = {}) {
       (pendente.matricula && matsCedidos.has(matKey(pendente.matricula)));
     const candidatos = indice.candidatosPara(pendente);
     let melhor = null;
-    let melhorScore = null;
+    let melhorAval = null;
 
     for (const cand of candidatos) {
       stats.tentativas++;
-      const sc = calcularScoreMatch(pendente, cand, {
-        matsCedidos,
-        cedidosIds,
-        ehCedido
-      });
-      if (sc.score > (melhorScore?.score || 0)) {
+      const av = avaliarMatch(pendente, cand, { matsCedidos, cedidosIds, ehCedido });
+      const prio = {
+        [CLASSIFICACAO.SEGURO]: 4,
+        [CLASSIFICACAO.PROVAVEL]: 3,
+        [CLASSIFICACAO.DIVERGENCIA]: 2,
+        [CLASSIFICACAO.SEM_MATCH]: 1
+      };
+      const cur = prio[av.classificacao] || 0;
+      const best = melhorAval ? prio[melhorAval.classificacao] || 0 : 0;
+      if (cur > best || (cur === best && (av.sim || 0) > (melhorAval?.sim || 0))) {
         melhor = cand;
-        melhorScore = sc;
+        melhorAval = av;
       }
     }
 
-    if (melhor && melhorScore && deveGravarMatch(melhorScore, pendente)) {
-      if (melhorScore.nivel === 'seguro') stats.matches_seguros++;
+    if (melhorAval?.classificacao === CLASSIFICACAO.DIVERGENCIA) {
+      stats.divergencias++;
+      divergencias.push({
+        pendente,
+        item: melhor,
+        avaliacao: melhorAval,
+        estrategia: 'bulk_indice_local'
+      });
+      restantes.push(pendente);
+    } else if (melhor && melhorAval && deveGravarMatch(melhorAval)) {
+      if (melhorAval.classificacao === CLASSIFICACAO.SEGURO) stats.matches_seguros++;
       else stats.matches_provaveis++;
       matches.push({
         pendente,
         item: melhor,
-        score: melhorScore,
+        score: melhorAval,
+        classificacao: melhorAval.classificacao,
         estrategia: 'bulk_indice_local',
         fonte: melhor._fonte || 'bulk'
       });
     } else {
-      if (melhorScore && melhorScore.nivel === 'provavel') stats.rejeitados++;
-      else if (melhorScore && melhorScore.nivel === 'rejeitado') stats.rejeitados++;
+      stats.sem_match++;
       restantes.push(pendente);
     }
   }
 
-  return { matches, restantes, stats };
+  return { matches, divergencias, restantes, stats };
 }
 
 export function criarStatsBusca() {
   return {
     total_rh: 0,
+    total_pendentes: 0,
     bulk_bruto: 0,
     bulk_util: 0,
     bulk_matches: 0,
+    bulk_inseridos: 0,
     pendentes_iniciais: 0,
     buscas_nome: 0,
     tentativas_nome: 0,
     matches_nome: 0,
     matches_seguros: 0,
     matches_provaveis: 0,
+    divergencias: 0,
     rejeitados: 0,
     sem_match: 0,
     cedidos_processados: 0,
+    chamadas_giap_evitadas: 0,
     tempo_bulk_ms: 0,
     tempo_nomes_ms: 0,
     tempo_total_ms: 0,
     estrategias: {},
-    letras: []
+    letras: [],
+    prefixos: []
   };
 }
 
@@ -481,11 +525,13 @@ export function registrarEstrategia(stats, nome, encontrou, duracaoMs) {
 }
 
 export function resumoEstrategias(stats) {
-  return Object.values(stats.estrategias || {}).map((e) => ({
+  const lista = Object.values(stats.estrategias || {}).map((e) => ({
     estrategia: e.estrategia,
     tentativas: e.tentativas,
     encontrados: e.encontrados,
     tempo_medio_ms: e.tentativas ? Math.round(e.tempo_total_ms / e.tentativas) : 0,
     taxa_sucesso: e.tentativas ? Math.round((e.encontrados / e.tentativas) * 1000) / 10 : 0
   }));
+  lista.sort((a, b) => b.taxa_sucesso - a.taxa_sucesso || b.encontrados - a.encontrados);
+  return lista;
 }
