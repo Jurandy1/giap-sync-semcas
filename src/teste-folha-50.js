@@ -93,7 +93,7 @@ async function executarFluxoProducao({
     pendentes: candidatos,
     metricas,
     manterBrowser: true,
-    comTimeout: (fn, label) => comTimeout(fn(), SCRAPE_WATCHDOG_MS, label),
+    comTimeout,
     watchdogMs: SCRAPE_WATCHDOG_MS
   });
   const tempo_bulk_ms = Date.now() - tBulk;
@@ -107,7 +107,7 @@ async function executarFluxoProducao({
     cedencias,
     codigoOrgao: String(codigoOrgao),
     maxBuscas: candidatos.length,
-    comTimeout: (fn, label) => comTimeout(fn(), SCRAPE_WATCHDOG_MS, label),
+    comTimeout,
     watchdogMs: SCRAPE_WATCHDOG_MS,
     metricas
   });
@@ -211,7 +211,7 @@ export async function executarTesteFolha50(opts = {}) {
       cedencias,
       codigoOrgao: String(codigoOrgao),
       maxBuscas: candidatos.length,
-      comTimeout: (fn, label) => comTimeout(fn(), SCRAPE_WATCHDOG_MS, label),
+      comTimeout,
       watchdogMs: SCRAPE_WATCHDOG_MS
     });
     await closeBrowser().catch(() => {});
