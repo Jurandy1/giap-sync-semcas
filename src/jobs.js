@@ -111,6 +111,119 @@ async function updateJob(id, patch) {
 }
 
 /**
+ * Rede de segurança para a cadeia de lotes de sync da folha.
+ *
+ * `agendarProximoLote` dispara o próximo lote de dentro do próprio processo
+ * (setTimeout + closeBrowser + criarEExecutarJob), sem HTTP e sem depender do
+ * navegador — mas se o processo cair no meio dessa janela (OOM do Chromium,
+ * deploy, restart do Render), a promise em memória some com ele e nenhum job
+ * novo chega a ser inserido no banco. O job anterior fica marcado "done" com
+ * resumo.continuara=true para sempre, e nada nunca retoma.
+ *
+ * Esta função procura exatamente esse caso — competência cujo job mais
+ * recente terminou "done" com continuara=true, sem job ativo e sem pendentes
+ * zerados — e cria a continuação. Chamada no boot (recupera de crash) e por
+ * um intervalo periódico (rede de segurança enquanto o processo está de pé).
+ */
+export async function retomarCadeiasInterrompidas() {
+  if (cadeiaCancelada) return { retomados: 0, motivo: 'cadeia_cancelada' };
+
+  const { data: recentes, error } = await sb()
+    .from('giap_jobs')
+    .select('id, tipo, competencia, status, modo, dry_run, resumo, erro, created_at')
+    .in('tipo', TIPOS_SYNC_FOLHA)
+    .order('id', { ascending: false })
+    .limit(50);
+  if (error) {
+    console.error('[jobs] retomar cadeias: listar recentes:', error.message);
+    return { retomados: 0, erro: error.message };
+  }
+
+  // Último job por competência (já veio ordenado por id desc).
+  const ultimoPorCompetencia = new Map();
+  for (const j of recentes || []) {
+    if (!ultimoPorCompetencia.has(j.competencia)) ultimoPorCompetencia.set(j.competencia, j);
+  }
+
+  let retomados = 0;
+  for (const job of ultimoPorCompetencia.values()) {
+    // Dois casos legítimos de retomada:
+    // 1) job terminou um lote normalmente e avisou que tem mais gente (done_parcial).
+    // 2) job ficou "running" quando o processo caiu no meio do lote — o boot já
+    //    marcou como "error" com essa mensagem específica (limparJobsOrfaos), o
+    //    que é diferente de um erro real de scrape/matching (esses não têm essa
+    //    marca e não devem virar retry automático em loop).
+    const parcialConcluido = job.status === 'done' && job.resumo?.continuara === true;
+    const orfaoPorRestart = job.status === 'error' && /reiniciou/i.test(job.erro || '');
+    if (!parcialConcluido && !orfaoPorRestart) continue;
+
+    const { count: ativos } = await sb()
+      .from('giap_jobs')
+      .select('id', { count: 'exact', head: true })
+      .eq('competencia', job.competencia)
+      .in('status', ['pending', 'running']);
+    if ((ativos || 0) > 0) continue;
+
+    let ainda = [];
+    try {
+      ainda = await listarBuscasNomePendentes(job.competencia);
+    } catch (e) {
+      console.warn('[jobs] retomar cadeias: checar pendentes falhou, tenta mesmo assim:', e.message);
+      ainda = [{ funcionario_id: -1 }]; // não bloqueia a retomada por falha transitória
+    }
+    if (!ainda.length) continue;
+
+    console.warn(
+      `[jobs] retomando cadeia interrompida (${orfaoPorRestart ? 'job travado por restart' : 'done_parcial sem continuação'}): ` +
+        `competência ${job.competencia}, job anterior #${job.id}, ~${ainda.length} pendente(s)`
+    );
+
+    const filtrosAnteriores = job.resumo?.filtros || {};
+    try {
+      await criarEExecutarJob({
+        tipo: job.tipo,
+        competencia: job.competencia,
+        modo: 'continuar',
+        dryRun: !!job.dry_run,
+        limparOrfaos: false,
+        filtros: {
+          ...filtrosAnteriores,
+          continuarAteCompletar: true,
+          _cadeia: Number(filtrosAnteriores._cadeia || 0) + 1,
+          _job_anterior: job.id,
+          _retomado_apos_interrupcao: true
+        }
+      });
+      retomados++;
+    } catch (e) {
+      console.error('[jobs] retomar cadeias: falha ao criar job de continuação:', e.message);
+    }
+  }
+  return { retomados };
+}
+
+const WATCHDOG_INTERVAL_MS = Math.max(
+  30000,
+  Number(process.env.GIAP_WATCHDOG_INTERVAL_MS || 120000)
+);
+let watchdogTimer = null;
+
+/** Inicia a checagem periódica de cadeias interrompidas (chamar 1x no boot). */
+export function iniciarWatchdogCadeias() {
+  if (watchdogTimer) return;
+  const tick = async () => {
+    try {
+      const r = await retomarCadeiasInterrompidas();
+      if (r.retomados) console.log(`[jobs] watchdog retomou ${r.retomados} cadeia(s)`);
+    } catch (e) {
+      console.error('[jobs] watchdog de cadeias falhou:', e.message);
+    }
+  };
+  watchdogTimer = setInterval(tick, WATCHDOG_INTERVAL_MS);
+  tick();
+}
+
+/**
  * Cria job e processa em background.
  */
 export async function criarEExecutarJob({
@@ -815,7 +928,11 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao, filt
             progresso: resumo.progresso,
             metricas: resumo.metricas,
             sincronizar_remuneracoes: resumo.sincronizar_remuneracoes,
-            continuara: buscasPendentes > 0 && AUTO_CONTINUAR && filtros?.continuarAteCompletar !== false
+            continuara:
+              buscasPendentes > 0 &&
+              AUTO_CONTINUAR &&
+              filtros?.continuarAteCompletar !== false &&
+              !cadeiaCancelada
           }
         });
         running.delete(jobId);

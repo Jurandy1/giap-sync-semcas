@@ -9,7 +9,15 @@ import {
 import { scrapeRemuneracoes, scrapeOrgaos, closeBrowser } from './scraper.js';
 import { competenciaAtual, validarCompetencia } from './utils.js';
 import { enriquecerFuncionarios, aplicarExoneracoes, CODIGO_ORGAO_SEMCAS } from './rhsemcas.js';
-import { criarEExecutarJob, obterJob, tentarCronMensal, limparJobsOrfaos, cancelarCadeiaContinua } from './jobs.js';
+import {
+  criarEExecutarJob,
+  obterJob,
+  tentarCronMensal,
+  limparJobsOrfaos,
+  cancelarCadeiaContinua,
+  retomarCadeiasInterrompidas,
+  iniciarWatchdogCadeias
+} from './jobs.js';
 
 const app = express();
 app.use(express.json({ limit: '2mb' }));
@@ -52,8 +60,10 @@ app.get('/', (req, res) => {
       'POST /rhsemcas/enriquecer   {competencia?, dryRun?}',
       'POST /rhsemcas/exoneracoes  {competencia?, dryRun?}',
       'POST /jobs                  {tipo?, competencia?, dryRun?, modo?}',
+      'POST /jobs/parar-cadeia',
       'GET  /jobs/:id',
       'POST /cron/mensal',
+      'POST /cron/continuar-lotes  — força checagem de cadeias interrompidas',
       'GET  /orgaos'
     ]
   });
@@ -439,6 +449,23 @@ app.post('/jobs/parar-cadeia', async (_req, res) => {
   }
 });
 
+/**
+ * Rede de segurança: retoma na hora qualquer cadeia de lotes que ficou
+ * "done_parcial"/continuara=true sem job seguinte (processo caiu no meio da
+ * continuação em 2º plano). Já roda sozinha no boot e a cada
+ * GIAP_WATCHDOG_INTERVAL_MS — este endpoint serve para forçar a checagem
+ * (ex.: ping externo de keep-alive) sem esperar o próximo tick.
+ */
+app.post('/cron/continuar-lotes', async (_req, res) => {
+  try {
+    const result = await retomarCadeiasInterrompidas();
+    res.json(result);
+  } catch (e) {
+    console.error('[/cron/continuar-lotes]', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.get('/jobs/:id', async (req, res) => {
   try {
     const job = await obterJob(Number(req.params.id));
@@ -464,8 +491,12 @@ app.post('/cron/mensal', async (req, res) => {
 const PORT = process.env.PORT || 3000;
 const server = app.listen(PORT, () => {
   console.log(`giap-sync-semcas listening on :${PORT}`);
-  // Jobs presos em running de antes do restart (OOM/deploy) viram error
-  limparJobsOrfaos().catch((e) => console.error('[boot] limpar órfãos:', e.message));
+  // Jobs presos em running de antes do restart (OOM/deploy) viram error;
+  // só depois disso a checagem de retomada roda (senão um job "running" órfão
+  // ainda não marcado como error pareceria "já tem job ativo" e bloquearia a retomada).
+  limparJobsOrfaos()
+    .catch((e) => console.error('[boot] limpar órfãos:', e.message))
+    .finally(() => iniciarWatchdogCadeias());
 });
 
 async function shutdown() {
