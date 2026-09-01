@@ -51,6 +51,19 @@ const SCRAPE_WATCHDOG_MS = Math.max(
   Number(process.env.GIAP_SCRAPE_WATCHDOG_MS || 180000)
 );
 
+/**
+ * Teto pro lote inteiro de busca por nome (não por scrape individual). Se o
+ * Chrome zumbi (CDP morto, "Network.enable timed out") faz cada tentativa
+ * pagar o protocolTimeout inteiro, um lote de 50 nomes pode ficar "running"
+ * por horas sem nunca falhar — e como nunca vira "error", o watchdog de
+ * retomada (retomarCadeiasInterrompidas) não tem o que resgatar. Isso corta
+ * o lote na marra bem antes do Render notar e reiniciar o container sozinho.
+ */
+const LOTE_WATCHDOG_MS = Math.max(
+  180000,
+  Number(process.env.GIAP_LOTE_WATCHDOG_MS || 720000)
+);
+
 const running = new Map(); // jobId -> promise
 /** Quando true, não agenda próximo lote (Parar lotes no RH). */
 let cadeiaCancelada = false;
@@ -149,13 +162,14 @@ export async function retomarCadeiasInterrompidas() {
   for (const job of ultimoPorCompetencia.values()) {
     // Dois casos legítimos de retomada:
     // 1) job terminou um lote normalmente e avisou que tem mais gente (done_parcial).
-    // 2) job ficou "running" quando o processo caiu no meio do lote — o boot já
-    //    marcou como "error" com essa mensagem específica (limparJobsOrfaos), o
-    //    que é diferente de um erro real de scrape/matching (esses não têm essa
-    //    marca e não devem virar retry automático em loop).
+    // 2) job errou por causa infraestrutural, não de negócio — processo caiu no
+    //    meio do lote (limparJobsOrfaos marca "...reiniciou...") ou o lote
+    //    travou tempo demais e o LOTE_WATCHDOG_MS cortou (comTimeout marca
+    //    "watchdog: ..."). Um erro real de scrape/matching não tem nenhuma das
+    //    duas marcas e não deve virar retry automático em loop.
     const parcialConcluido = job.status === 'done' && job.resumo?.continuara === true;
-    const orfaoPorRestart = job.status === 'error' && /reiniciou/i.test(job.erro || '');
-    if (!parcialConcluido && !orfaoPorRestart) continue;
+    const erroInfra = job.status === 'error' && /reiniciou|^watchdog:/i.test(job.erro || '');
+    if (!parcialConcluido && !erroInfra) continue;
 
     // Só a competência vigente. Sem isso, qualquer mês antigo que tenha
     // ficado com continuara=true pendurado (ex.: 202607, 202508 — meses já
@@ -181,7 +195,7 @@ export async function retomarCadeiasInterrompidas() {
     if (!ainda.length) continue;
 
     console.warn(
-      `[jobs] retomando cadeia interrompida (${orfaoPorRestart ? 'job travado por restart' : 'done_parcial sem continuação'}): ` +
+      `[jobs] retomando cadeia interrompida (${erroInfra ? `erro infra: ${job.erro}` : 'done_parcial sem continuação'}): ` +
         `competência ${job.competencia}, job anterior #${job.id}, ~${ainda.length} pendente(s)`
     );
 
@@ -711,22 +725,26 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao, filt
           }
         });
 
-        bulkRes = await executarFaseBulk({
-          competencia,
-          codigoOrgao: String(codigoOrgao),
-          pendentes: todasPendentes,
-          metricas,
-          manterBrowser: true,
-          cache: jobCache,
-          comTimeout,
-          watchdogMs: SCRAPE_WATCHDOG_MS,
-          onProgress: async (p) => {
-            await updateJob(jobId, {
-              progresso_pct: Math.min(15, 2 + (p.letra_idx || 0)),
-              resumo: { ...resumo, etapa: p.etapa, bulk: p }
-            });
-          }
-        });
+        bulkRes = await comTimeout(
+          executarFaseBulk({
+            competencia,
+            codigoOrgao: String(codigoOrgao),
+            pendentes: todasPendentes,
+            metricas,
+            manterBrowser: true,
+            cache: jobCache,
+            comTimeout,
+            watchdogMs: SCRAPE_WATCHDOG_MS,
+            onProgress: async (p) => {
+              await updateJob(jobId, {
+                progresso_pct: Math.min(15, 2 + (p.letra_idx || 0)),
+                resumo: { ...resumo, etapa: p.etapa, bulk: p }
+              });
+            }
+          }),
+          LOTE_WATCHDOG_MS,
+          'lote_bulk'
+        );
 
         syncRes = {
           success: true,
@@ -802,31 +820,35 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao, filt
       } catch (_) { /* ok */ }
 
       if (!pularBuscasNome && buscasNome.length) {
-        buscaInteligenteRes = await processarPendentesInteligente({
-          pendentes: buscasNome,
-          competencia,
-          bulkIndex: bulkRes?.indice || null,
-          cache: jobCache,
-          indiceHistorico,
-          cedencias,
-          codigoOrgao: String(codigoOrgao),
-          maxBuscas: maxBuscasEfetivo,
-          comTimeout,
-          watchdogMs: SCRAPE_WATCHDOG_MS,
-          metricas,
-          onProgress: async ({ i, total, nome }) => {
-            await updateJob(jobId, {
-              progresso_pct: Math.round(18 + (i / Math.max(total, 1)) * 12),
-              processados: i,
-              total,
-              resumo: {
-                ...resumo,
-                etapa: `sync_nome_inteligente_${i}/${total}`,
-                nome_atual: nome
-              }
-            });
-          }
-        });
+        buscaInteligenteRes = await comTimeout(
+          processarPendentesInteligente({
+            pendentes: buscasNome,
+            competencia,
+            bulkIndex: bulkRes?.indice || null,
+            cache: jobCache,
+            indiceHistorico,
+            cedencias,
+            codigoOrgao: String(codigoOrgao),
+            maxBuscas: maxBuscasEfetivo,
+            comTimeout,
+            watchdogMs: SCRAPE_WATCHDOG_MS,
+            metricas,
+            onProgress: async ({ i, total, nome }) => {
+              await updateJob(jobId, {
+                progresso_pct: Math.round(18 + (i / Math.max(total, 1)) * 12),
+                processados: i,
+                total,
+                resumo: {
+                  ...resumo,
+                  etapa: `sync_nome_inteligente_${i}/${total}`,
+                  nome_atual: nome
+                }
+              });
+            }
+          }),
+          LOTE_WATCHDOG_MS,
+          'lote_sync_nome'
+        );
 
         for (const r of buscaInteligenteRes.resultados || []) {
           verificadosNome.add(r.pendente.funcionario_id);
