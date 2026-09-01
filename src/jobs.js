@@ -157,6 +157,13 @@ export async function retomarCadeiasInterrompidas() {
     const orfaoPorRestart = job.status === 'error' && /reiniciou/i.test(job.erro || '');
     if (!parcialConcluido && !orfaoPorRestart) continue;
 
+    // Só a competência vigente. Sem isso, qualquer mês antigo que tenha
+    // ficado com continuara=true pendurado (ex.: 202607, 202508 — meses já
+    // fechados) volta a ser puxado sozinho pra sempre. Retomar competência
+    // passada só deve acontecer se o usuário pedir manualmente (botão
+    // "Buscar e gravar folha" com aquele mês selecionado).
+    if (job.competencia !== competenciaAtual()) continue;
+
     const { count: ativos } = await sb()
       .from('giap_jobs')
       .select('id', { count: 'exact', head: true })
@@ -352,6 +359,18 @@ async function agendarProximoLote({
   if (filtros?.continuarAteCompletar === false) return null;
   if (cadeiaCancelada) {
     console.log('[jobs] continuação cancelada (flag parar)');
+    return null;
+  }
+  // Encadeamento automático da folha (sync_orgao/sync_folha/ciclo_completo)
+  // só pra competência vigente. Um mês antigo (ex.: já virou 202608 e isso
+  // ainda é 202607) não deve ficar se auto-continuando pra sempre — quem
+  // quiser reprocessar um mês fechado clica de novo, lote a lote,
+  // manualmente. Não vale pra auditoria_saidas: essa varre competências
+  // passadas de propósito (é o objetivo dela).
+  if (TIPOS_SYNC_FOLHA.includes(tipo) && Number(competencia) !== competenciaAtual()) {
+    console.log(
+      `[jobs] continuação automática pulada: competência ${competencia} não é mais a vigente (${competenciaAtual()})`
+    );
     return null;
   }
 
