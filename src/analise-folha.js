@@ -31,11 +31,13 @@ export function classificarMotivoPendente(pendente, ctx = {}) {
   return 'outro';
 }
 
-export function montarAuditoriaCandidatos(candidatos, auditPorId, detalhes, pendentesPosIds) {
+export function montarAuditoriaCandidatos(candidatos, auditPorId, detalhes, idsResolvidosFolha) {
+  const resolvidoSet =
+    idsResolvidosFolha instanceof Set ? idsResolvidosFolha : new Set(idsResolvidosFolha || []);
   return candidatos.map((c) => {
     const audit = auditPorId.get(c.funcionario_id) || { tentativas: [] };
     const det = detalhes.find((d) => d.funcionario_id === c.funcionario_id);
-    const resolvido = !pendentesPosIds.has(c.funcionario_id);
+    const resolvido = resolvidoSet.has(c.funcionario_id);
     const nomeHist = c.historico?.funcionario || null;
     const prefixos = [];
     const sig = tokensSignificativos(c.nome);
@@ -96,11 +98,11 @@ export function montarRelatorioAnalise({
   candidatos,
   auditPorId,
   detalhes,
-  pendentesPosIds,
+  idsResolvidosFolha,
   metricas,
   comparacaoAntes = null
 }) {
-  const auditoria = montarAuditoriaCandidatos(candidatos, auditPorId, detalhes, pendentesPosIds);
+  const auditoria = montarAuditoriaCandidatos(candidatos, auditPorId, detalhes, idsResolvidosFolha);
   const pendentesDetalhe = auditoria.filter((a) => !a.resolvido);
   const porMotivo = {};
   for (const p of pendentesDetalhe) {

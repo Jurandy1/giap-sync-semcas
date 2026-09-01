@@ -55,11 +55,12 @@ function statsTempos(vals) {
   };
 }
 
-function montarTabelaVerificacao(candidatos, detalhes, pendentesPosIds) {
+function montarTabelaVerificacao(candidatos, detalhes, idsResolvidosFolha) {
   const porId = new Map((detalhes || []).map((d) => [d.funcionario_id, d]));
+  const resolvidoSet = idsResolvidosFolha instanceof Set ? idsResolvidosFolha : new Set(idsResolvidosFolha || []);
   return candidatos.map((c) => {
     const d = porId.get(c.funcionario_id);
-    const resolvido = idsResolvidosFolha.has(c.funcionario_id);
+    const resolvido = resolvidoSet.has(c.funcionario_id);
     return {
       funcionario_id: c.funcionario_id,
       nome_rh: c.nome,
@@ -219,7 +220,7 @@ export async function executarTesteFolha50(opts = {}) {
   const tabela = montarTabelaVerificacao(
     candidatos,
     exec1.buscaRes.detalhes_candidatos,
-    pendentesPosIds
+    idsResolvidosFolha
   );
 
   let idempotencia = null;
@@ -310,7 +311,7 @@ export async function executarTesteFolha50(opts = {}) {
     candidatos,
     auditPorId: exec1.buscaRes.audit_por_id || new Map(),
     detalhes: exec1.buscaRes.detalhes_candidatos,
-    pendentesPosIds,
+    idsResolvidosFolha,
     metricas: stats,
     comparacaoAntes: BASELINE_TESTE_50
   });
