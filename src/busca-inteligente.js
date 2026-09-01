@@ -1,8 +1,10 @@
 /**
- * Busca inteligente: histórico → índice bulk → matching local → busca por exceção.
+ * Busca inteligente: histórico → índice bulk → matching local → busca adaptativa.
  */
 import { scrapeRemuneracoes } from './scraper.js';
 import { transformar, upsertRegistrosFolha } from './sync.js';
+import { obterResultadosGiap } from './consulta-giap.js';
+import { origemMatchPrincipal } from './analise-folha.js';
 import {
   avaliarMatch,
   deveGravarMatch,
@@ -11,13 +13,11 @@ import {
   GiapBulkIndex,
   GiapSearchCache,
   criarStatsBusca,
-  registrarEstrategia,
   resumoEstrategias,
   CLASSIFICACAO,
   matKey,
   codigoOrgaoParaBusca
 } from './matching.js';
-import { normalizarRespostaLista } from './utils.js';
 import {
   estrategiasComHistorico,
   medirCoberturaHistorico,
@@ -25,26 +25,16 @@ import {
   historicoEhConfiavel
 } from './historico.js';
 
-function origemMatchDeResultado(r) {
-  const fatores = r.avaliacao?.fatores || [];
-  const via = r.via || '';
-  if (via === 'bulk_local' || r.estrategia?.startsWith?.('prefixo')) return 'prefixo';
-  if (via === 'indice_local' || via === 'bulk_local') return 'bulk';
-  if (via === 'historico' || fatores.some((f) => /historico/i.test(f))) return 'historico';
-  if (fatores.some((f) => /matricula/i.test(f) && !/historico/i.test(f))) return 'matricula';
-  if (fatores.some((f) => /cpf/i.test(f))) return 'cpf';
-  if (via === 'nome') return 'nome';
-  return via || 'desconhecido';
-}
-
-function registrarMatchPorOrigem(stats, origem) {
-  const k = `matches_por_${origem}`;
-  if (stats[k] != null) stats[k]++;
-  else stats[k] = 1;
-}
-
 function linhaDetalheCandidato(pendente, r, opts = {}) {
   const reg = r?.registros?.[0];
+  const origem = r
+    ? origemMatchPrincipal({
+        avaliacao: r.avaliacao,
+        via: r.via,
+        estrategia: r.estrategia,
+        viaBulkPrefixo: r.via === 'bulk_local' && r.estrategia?.startsWith?.('prefixo')
+      })
+    : null;
   return {
     funcionario_id: pendente.funcionario_id,
     nome_rh: pendente.nome,
@@ -55,7 +45,7 @@ function linhaDetalheCandidato(pendente, r, opts = {}) {
     nome_giap: reg?.funcionario || r?.nome_giap || null,
     matricula_giap: reg?.matricula ?? null,
     codigo_orgao: reg?.codigo_orgao ?? r?.item?.codigo_orgao ?? null,
-    origem_match: r ? origemMatchDeResultado(r) : null,
+    origem_match: origem,
     via: r?.via || null,
     estrategia: r?.estrategia || null,
     classificacao: r?.classificacao || opts.classificacao || null,
@@ -64,6 +54,95 @@ function linhaDetalheCandidato(pendente, r, opts = {}) {
     tempo_ms: opts.tempo_ms ?? null,
     motivo: opts.motivo || r?.avaliacao?.motivo || null
   };
+}
+
+function registrarMatchExclusivo(stats, origem) {
+  const k = `matches_por_${origem}`;
+  if (stats[k] != null) stats[k]++;
+  else stats[k] = 1;
+}
+
+function melhorMatchNosDados(pendente, data, opts) {
+  let melhor = null;
+  let melhorAv = null;
+  for (const item of data) {
+    const av = avaliarMatch(pendente, item, opts);
+    const prio = {
+      [CLASSIFICACAO.SEGURO]: 4,
+      [CLASSIFICACAO.PROVAVEL]: 3,
+      [CLASSIFICACAO.DIVERGENCIA]: 2,
+      [CLASSIFICACAO.SEM_MATCH]: 1
+    };
+    const cur = prio[av.classificacao] || 0;
+    const best = melhorAv ? prio[melhorAv.classificacao] || 0 : 0;
+    if (cur > best || (cur === best && (av.sim || 0) > (melhorAv?.sim || 0))) {
+      melhor = item;
+      melhorAv = av;
+    }
+  }
+  return { melhor, melhorAv };
+}
+
+function deveContinuarAposResultado({ bruto, melhorAv, estrategiaAtual, proximaEstrategia, estrategiasRestantes }) {
+  if (!estrategiasRestantes.length) return false;
+  if (bruto === 0) return true;
+  if (melhorAv?.classificacao === CLASSIFICACAO.DIVERGENCIA) return false;
+  if (bruto === 1 && melhorAv?.classificacao === CLASSIFICACAO.SEM_MATCH) return false;
+  if (bruto > 1 && proximaEstrategia && proximaEstrategia.length > estrategiaAtual.length) return true;
+  return false;
+}
+
+async function gravarMatch({
+  pendente,
+  matchFinal,
+  avalFinal,
+  estrategiaUsada,
+  via,
+  competencia,
+  stats,
+  metricas,
+  ehCedido,
+  resultados,
+  detalhesCandidatos,
+  jobCache,
+  tCand
+}) {
+  const reg = transformar({ ...matchFinal, competencia });
+  const ups = await upsertRegistrosFolha([reg]);
+  if (ups.inseridos <= 0) return false;
+
+  stats.registros_novos += ups.novos || 0;
+  stats.registros_atualizados += ups.atualizados || 0;
+  if (avalFinal.classificacao === CLASSIFICACAO.SEGURO) stats.matches_seguros++;
+  else stats.matches_provaveis++;
+
+  const rObj = {
+    pendente,
+    registros: ups.registros,
+    classificacao: avalFinal.classificacao,
+    avaliacao: avalFinal,
+    estrategia: estrategiaUsada,
+    via,
+    nome_giap: matchFinal.funcionario,
+    historico_comp: pendente.historico?.competencia
+  };
+
+  const origem = origemMatchPrincipal({ avaliacao: avalFinal, via, estrategia: estrategiaUsada });
+  registrarMatchExclusivo(stats, origem);
+  if (via === 'historico') stats.resultados_por_historico++;
+  else if (via === 'nome') stats.resultados_por_nome++;
+  else if (via === 'indice_local' || via === 'bulk_local') stats.resultados_por_bulk++;
+
+  if (ehCedido) {
+    stats.cedidos_processados++;
+    stats.cedidos_resolvidos++;
+  }
+
+  detalhesCandidatos.push(linhaDetalheCandidato(pendente, rObj, { tempo_ms: Date.now() - tCand }));
+  jobCache.marcarResolvido(pendente.funcionario_id);
+  metricas?.registrarUpsert(ups.inseridos);
+  resultados.push(rObj);
+  return true;
 }
 
 export async function processarPendentesInteligente({
@@ -94,7 +173,9 @@ export async function processarPendentesInteligente({
   stats.consultas_giap = 0;
   stats.candidatos_processados = 0;
   stats.prefixos_unicos_exec = 0;
+
   const detalhesCandidatos = [];
+  const auditPorId = new Map();
   const t0 = Date.now();
   const indice = bulkIndex || new GiapBulkIndex();
   const jobCache = cache || new GiapSearchCache();
@@ -140,10 +221,14 @@ export async function processarPendentesInteligente({
         registros: ups.registros,
         classificacao: m.classificacao,
         avaliacao: m.score,
-        via: 'bulk_local'
+        via: 'bulk_local',
+        estrategia: m.item._fonte || 'bulk'
       };
       gravadosBulk.push(rObj);
-      registrarMatchPorOrigem(stats, 'bulk');
+      registrarMatchExclusivo(
+        stats,
+        origemMatchPrincipal({ avaliacao: m.score, via: 'bulk_local', estrategia: m.item._fonte })
+      );
       if (m.pendente.eh_cedido) stats.cedidos_resolvidos++;
       detalhesCandidatos.push(linhaDetalheCandidato(m.pendente, rObj));
       jobCache.marcarResolvido(m.pendente.funcionario_id);
@@ -151,7 +236,7 @@ export async function processarPendentesInteligente({
     }
   }
 
-  let restantes = cruzado.restantes.filter((p) => !jobCache.jaResolvido(p.funcionario_id));
+  const restantes = cruzado.restantes.filter((p) => !jobCache.jaResolvido(p.funcionario_id));
   const fila = restantes.slice(0, maxBuscas);
 
   const debugNomes = [];
@@ -168,6 +253,9 @@ export async function processarPendentesInteligente({
     const pendente = fila[i];
     stats.candidatos_processados++;
     const tCand = Date.now();
+    const audit = { tentativas: [], tentativa_resolveu: null };
+    auditPorId.set(pendente.funcionario_id, audit);
+
     if (jobCache.jaResolvido(pendente.funcionario_id)) continue;
 
     const ehCedido =
@@ -178,13 +266,9 @@ export async function processarPendentesInteligente({
     const usaHistorico = historicoEhConfiavel(pendente.historico);
     const estrategias = estrategiasComHistorico(pendente, pendente.historico);
     const codigoOrgaoBusca = codigoOrgaoParaBusca(pendente, codigoOrgao);
+    const matchOpts = { matsCedidos, cedidosIds: cedencias.ids, ehCedido };
 
-    // Reutiliza índice bulk/histórico antes de chamar GIAP
-    const localPre = matchPendenteNoIndice(pendente, indice, {
-      matsCedidos,
-      cedidosIds: cedencias.ids,
-      ehCedido
-    });
+    const localPre = matchPendenteNoIndice(pendente, indice, { ...matchOpts, ehCedido });
     if (localPre?.classificacao === CLASSIFICACAO.DIVERGENCIA) {
       stats.divergencias++;
       stats.rejeitados++;
@@ -200,32 +284,25 @@ export async function processarPendentesInteligente({
       continue;
     }
     if (localPre && deveGravarMatch(localPre.avaliacao)) {
-      const reg = transformar({ ...localPre.item, competencia });
-      const ups = await upsertRegistrosFolha([reg]);
-      if (ups.inseridos > 0) {
-        stats.matches_nome++;
-        stats.resultados_por_bulk++;
-        stats.registros_novos += ups.novos || 0;
-        stats.registros_atualizados += ups.atualizados || 0;
+      const ok = await gravarMatch({
+        pendente,
+        matchFinal: localPre.item,
+        avalFinal: localPre.avaliacao,
+        estrategiaUsada: 'indice_local',
+        via: 'indice_local',
+        competencia,
+        stats,
+        metricas,
+        ehCedido,
+        resultados,
+        detalhesCandidatos,
+        jobCache,
+        tCand
+      });
+      if (ok) {
+        audit.tentativa_resolveu = 'indice_local';
         stats.chamadas_giap_evitadas++;
         stats.chamadas_giap_evitadas_matching_local++;
-        if (usaHistorico) stats.chamadas_giap_evitadas_historico++;
-        if (localPre.avaliacao.classificacao === CLASSIFICACAO.SEGURO) stats.matches_seguros++;
-        else stats.matches_provaveis++;
-        const rObj = {
-          pendente,
-          registros: ups.registros,
-          classificacao: localPre.classificacao,
-          avaliacao: localPre.avaliacao,
-          via: 'indice_local',
-          estrategia: 'indice_local'
-        };
-        registrarMatchPorOrigem(stats, origemMatchDeResultado(rObj));
-        if (ehCedido) stats.cedidos_resolvidos++;
-        detalhesCandidatos.push(linhaDetalheCandidato(pendente, rObj));
-        jobCache.marcarResolvido(pendente.funcionario_id);
-        metricas?.registrarUpsert(ups.inseridos);
-        resultados.push(rObj);
         continue;
       }
     }
@@ -234,100 +311,112 @@ export async function processarPendentesInteligente({
     let avalFinal = null;
     let melhorDivergencia = null;
     let estrategiaUsada = null;
-    let bruto = 0;
-    let ultimaBusca = null;
 
-    for (const estrategia of estrategias) {
+    for (let si = 0; si < estrategias.length; si++) {
+      const estrategia = estrategias[si];
+      const proxima = estrategias[si + 1] || null;
       stats.tentativas_nome++;
-      ultimaBusca = estrategia;
-      const cacheKey = `${estrategia}|org:${codigoOrgaoBusca || 'none'}`;
-      const cacheHit = jobCache.get(cacheKey);
-      let data;
-      let duracaoMs = 0;
 
-      if (cacheHit) {
-        data = cacheHit.data;
-        if (!Array.isArray(data)) {
-          const norm = normalizarRespostaLista(data);
-          if (norm.erro) throw new Error(norm.erro);
-          data = norm.lista;
-        }
-        duracaoMs = cacheHit.duracao_ms || 0;
-        stats.chamadas_giap_evitadas++;
-        if (usaHistorico) stats.chamadas_giap_evitadas_historico++;
-        registrarEstrategia(stats, `${estrategia}_cache`, data.length > 0, duracaoMs);
-      } else {
-        const t1 = Date.now();
-        try {
-          const r = await runScrape(
-            () =>
-              scrapeRemuneracoes({
-                competencia,
-                codigoInstituicao: 1,
-                codigoOrgao: codigoOrgaoBusca,
-                nomeServidor: estrategia,
-                quantidade: 100
-              }),
-            `sync_nome_${estrategia}_org${codigoOrgaoBusca || '0'}`
-          );
-          const norm = normalizarRespostaLista(r.data, { requestUrl: r.requestUrl, rawPrefix: r.raw });
-          if (norm.erro) throw new Error(norm.erro);
-          data = norm.lista;
-          duracaoMs = Date.now() - t1;
-          jobCache.set(cacheKey, { data, duracao_ms: duracaoMs });
-          scrapesNome++;
-          stats.buscas_nome++;
-          stats.consultas_giap++;
-          metricas?.registrarScrape('nome', duracaoMs);
-          registrarEstrategia(
-            stats,
-            usaHistorico ? `historico:${estrategia}` : estrategia,
-            data.length > 0,
-            duracaoMs
-          );
-        } catch (e) {
-          metricas?.registrarErro();
-          registrarEstrategia(stats, estrategia, false, Date.now() - t1);
-          continue;
-        }
+      let consulta;
+      try {
+        consulta = await obterResultadosGiap({
+          termo: estrategia,
+          codigoOrgao: codigoOrgaoBusca,
+          indice,
+          cache: jobCache,
+          stats,
+          metricas,
+          usaHistorico,
+          label: estrategia,
+          scrapeFn: () =>
+            runScrape(
+              () =>
+                scrapeRemuneracoes({
+                  competencia,
+                  codigoInstituicao: 1,
+                  codigoOrgao: codigoOrgaoBusca,
+                  nomeServidor: estrategia,
+                  quantidade: 100
+                }),
+              `sync_nome_${estrategia}_org${codigoOrgaoBusca || '0'}`
+            )
+        });
+      } catch (e) {
+        metricas?.registrarErro();
+        audit.tentativas.push({
+          termo: estrategia,
+          codigo_orgao: codigoOrgaoBusca,
+          origem: 'erro',
+          scrape: true,
+          bruto: 0,
+          match: false,
+          erro: e.message
+        });
+        continue;
       }
 
-      bruto = data.length;
+      if (consulta.scrape) scrapesNome++;
+
+      const data = consulta.data || [];
+      const bruto = data.length;
+
+      audit.tentativas.push({
+        termo: estrategia,
+        codigo_orgao: codigoOrgaoBusca,
+        origem: consulta.origem,
+        scrape: consulta.scrape,
+        bruto,
+        match: false,
+        tempo_ms: consulta.duracao_ms,
+        outro_orgao: data.some(
+          (d) => String(d.codigo_orgao) !== '9' && String(d.codigo_orgao) !== String(codigoOrgaoBusca)
+        )
+      });
+
       if (!data.length) continue;
 
       indice.addItems(data, usaHistorico ? `historico:${estrategia}` : `nome:${estrategia}`);
 
-      let melhor = null;
-      let melhorAv = null;
-      for (const item of data) {
-        const av = avaliarMatch(pendente, item, {
-          matsCedidos,
-          cedidosIds: cedencias.ids,
-          ehCedido
-        });
-        const prio = {
-          [CLASSIFICACAO.SEGURO]: 4,
-          [CLASSIFICACAO.PROVAVEL]: 3,
-          [CLASSIFICACAO.DIVERGENCIA]: 2,
-          [CLASSIFICACAO.SEM_MATCH]: 1
-        };
-        const cur = prio[av.classificacao] || 0;
-        const best = melhorAv ? prio[melhorAv.classificacao] || 0 : 0;
-        if (cur > best || (cur === best && (av.sim || 0) > (melhorAv?.sim || 0))) {
-          melhor = item;
-          melhorAv = av;
-        }
+      const localPos = matchPendenteNoIndice(pendente, indice, { ...matchOpts, ehCedido });
+      if (localPos?.classificacao === CLASSIFICACAO.DIVERGENCIA) {
+        melhorDivergencia = { item: localPos.item, avaliacao: localPos.avaliacao, estrategia };
+        break;
       }
+      if (localPos && deveGravarMatch(localPos.avaliacao)) {
+        matchFinal = localPos.item;
+        avalFinal = localPos.avaliacao;
+        estrategiaUsada = estrategia;
+        audit.tentativas[audit.tentativas.length - 1].match = true;
+        audit.tentativa_resolveu = estrategia;
+        break;
+      }
+
+      const { melhor, melhorAv } = melhorMatchNosDados(pendente, data, matchOpts);
 
       if (melhorAv?.classificacao === CLASSIFICACAO.DIVERGENCIA) {
         melhorDivergencia = { item: melhor, avaliacao: melhorAv, estrategia };
-        continue;
+        break;
       }
 
       if (melhor && melhorAv && deveGravarMatch(melhorAv)) {
         matchFinal = melhor;
         avalFinal = melhorAv;
         estrategiaUsada = estrategia;
+        audit.tentativas[audit.tentativas.length - 1].match = true;
+        audit.tentativa_resolveu = estrategia;
+        break;
+      }
+
+      const restantesEstrategias = estrategias.slice(si + 1);
+      if (
+        !deveContinuarAposResultado({
+          bruto,
+          melhorAv,
+          estrategiaAtual: estrategia,
+          proximaEstrategia: proxima,
+          estrategiasRestantes: restantesEstrategias
+        })
+      ) {
         break;
       }
     }
@@ -342,8 +431,6 @@ export async function processarPendentesInteligente({
           matricula_rh: pendente.matricula,
           classificacao: CLASSIFICACAO.DIVERGENCIA,
           motivo: melhorDivergencia.avaliacao?.motivo,
-          historico_comp: pendente.historico?.competencia,
-          nome_giap_hist: pendente.historico?.funcionario,
           estrategia: melhorDivergencia.estrategia
         });
       }
@@ -360,38 +447,23 @@ export async function processarPendentesInteligente({
     }
 
     if (matchFinal && avalFinal) {
-      const reg = transformar({ ...matchFinal, competencia });
-      const ups = await upsertRegistrosFolha([reg]);
-      if (ups.inseridos > 0) {
-        stats.matches_nome++;
-        stats.registros_novos += ups.novos || 0;
-        stats.registros_atualizados += ups.atualizados || 0;
-        if (usaHistorico) stats.resultados_por_historico++;
-        else stats.resultados_por_nome++;
-        if (avalFinal.classificacao === CLASSIFICACAO.SEGURO) stats.matches_seguros++;
-        else stats.matches_provaveis++;
-        if (ehCedido) {
-          stats.cedidos_processados++;
-          stats.cedidos_resolvidos++;
-        }
-        const rObj = {
-          pendente,
-          registros: ups.registros,
-          classificacao: avalFinal.classificacao,
-          avaliacao: avalFinal,
-          estrategia: estrategiaUsada,
-          via: usaHistorico ? 'historico' : 'nome',
-          nome_giap: matchFinal.funcionario,
-          historico_comp: pendente.historico?.competencia
-        };
-        registrarMatchPorOrigem(stats, origemMatchDeResultado(rObj));
-        detalhesCandidatos.push(
-          linhaDetalheCandidato(pendente, rObj, { tempo_ms: Date.now() - tCand })
-        );
-        jobCache.marcarResolvido(pendente.funcionario_id);
-        metricas?.registrarUpsert(ups.inseridos);
-        resultados.push(rObj);
-      } else {
+      const via = usaHistorico && estrategiaUsada === estrategias[0] ? 'historico' : 'nome';
+      const ok = await gravarMatch({
+        pendente,
+        matchFinal,
+        avalFinal,
+        estrategiaUsada,
+        via,
+        competencia,
+        stats,
+        metricas,
+        ehCedido,
+        resultados,
+        detalhesCandidatos,
+        jobCache,
+        tCand
+      });
+      if (!ok) {
         stats.sem_match++;
         detalhesCandidatos.push(
           linhaDetalheCandidato(pendente, null, { status: 'sem_match', tempo_ms: Date.now() - tCand })
@@ -404,11 +476,7 @@ export async function processarPendentesInteligente({
           nome_rh: pendente.nome,
           matricula_rh: pendente.matricula,
           grupo: pendente.grupo_historico,
-          historico_comp: pendente.historico?.competencia,
-          nome_giap_hist: pendente.historico?.funcionario,
           estrategias_tentadas: estrategias,
-          ultima_busca: ultimaBusca,
-          bruto,
           classificacao: CLASSIFICACAO.SEM_MATCH
         });
       }
@@ -431,6 +499,7 @@ export async function processarPendentesInteligente({
     stats,
     indice,
     cache: jobCache,
+    audit_por_id: auditPorId,
     resultados,
     divergencias,
     historico: histStats,

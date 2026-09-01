@@ -503,7 +503,7 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao, filt
       let pulouBulk = false;
       let todasPendentes = [];
       const pularBuscasNome = filtros?.pularBuscasNome === true;
-      const jobCache = filtros._cache_busca ? null : new GiapSearchCache();
+      const jobCache = filtros._cache_busca || new GiapSearchCache();
 
       let indiceHistorico = null;
       let statsHistorico = null;
@@ -552,6 +552,7 @@ async function executarJob(jobId, { tipo, competencia, dryRun, codigoOrgao, filt
           pendentes: todasPendentes,
           metricas,
           manterBrowser: true,
+          cache: jobCache,
           comTimeout,
           watchdogMs: SCRAPE_WATCHDOG_MS,
           onProgress: async (p) => {

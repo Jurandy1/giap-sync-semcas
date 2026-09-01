@@ -119,7 +119,8 @@ export async function executarFaseBulk({
   comTimeout = null,
   watchdogMs = 180000,
   onProgress = null,
-  manterBrowser = false
+  manterBrowser = false,
+  cache = null
 } = {}) {
   const tBulk = Date.now();
   const folhaAntes = await contarFolhaBulk(competencia, codigoOrgao);
@@ -217,6 +218,14 @@ export async function executarFaseBulk({
       detalhe.codigo_orgao_enviado = r.codigo_orgao_enviado;
       detalhe.request_url = r.parametros?.request_url;
       indice.addItems(bruto, `prefixo:${prefixo}`);
+      if (cache) {
+        cache.setConsulta(prefixo, String(codigoOrgao), {
+          data: bruto,
+          duracao_ms: detalhe.tempo_ms,
+          origem: 'bulk_prefixo'
+        });
+        if (!bruto.length) cache.marcarConsultaVazia(prefixo, String(codigoOrgao));
+      }
       stats.registros_giap += bruto.length;
       stats.bulk_bruto += bruto.length;
       stats.registros_indexados = indice.size;

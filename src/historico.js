@@ -149,7 +149,16 @@ export function classificarGrupoHistorico(pendente, historico, cedencias = { ids
   return { grupo: 'E', historico, eh_cedido: false };
 }
 
-/** Estratégias de busca GIAP — histórico primeiro, variantes só como fallback. */
+/** Nome histórico mais específico para 1ª consulta GIAP (Grupo A). */
+export function estrategiaHistoricoPrincipal(historico) {
+  if (!historico?.funcionario) return null;
+  const sig = tokensSignificativos(historico.funcionario);
+  if (sig.length >= 3) return sig.slice(0, 3).join(' ');
+  if (sig.length >= 2) return sig.join(' ');
+  return sig[0] || null;
+}
+
+/** Estratégias iniciais — histórico específico primeiro; Grupo A = 1 tentativa. */
 export function estrategiasComHistorico(pendente, historico) {
   const out = [];
   const add = (s) => {
@@ -157,18 +166,13 @@ export function estrategiasComHistorico(pendente, historico) {
     if (v.length >= 3 && !out.includes(v)) out.push(v);
   };
 
-  if (historico?.funcionario) {
-    const sig = tokensSignificativos(historico.funcionario);
-    if (sig[0]) add(sig[0]);
-    if (sig.length >= 2) add([sig[0], sig[1]].join(' '));
-    if (sig.length >= 3) add(sig.slice(0, 3).join(' '));
-  }
+  const principal = estrategiaHistoricoPrincipal(historico);
+  if (principal) add(principal);
 
   if (historicoEhConfiavel(historico)) {
-    return out.slice(0, 2);
+    return out.slice(0, 1);
   }
 
-  // Sem histórico confiável: busca progressiva completa (até GIAP_MAX_VARIANTES_NOME)
   for (const e of estrategiasBuscaProgressiva(pendente.nome, maxVariantesNome())) {
     add(e);
   }

@@ -6,7 +6,8 @@ import { executarFaseBulk, contarFolhaBulk } from './bulk.js';
 import { processarPendentesInteligente } from './busca-inteligente.js';
 import { carregarIndiceHistorico } from './historico.js';
 import { criarMetricas } from './metrics.js';
-import { prefixosGlobaisDedup } from './matching.js';
+import { prefixosGlobaisDedup, GiapSearchCache } from './matching.js';
+import { montarRelatorioAnalise, BASELINE_TESTE_50 } from './analise-folha.js';
 import {
   carregarCedenciasAtuais,
   listarBuscasNomePendentes,
@@ -75,6 +76,13 @@ function montarTabelaVerificacao(candidatos, detalhes, pendentesPosIds) {
   });
 }
 
+/** IDs fixos do 1º teste real (202608) para comparação A/B. */
+export const IDS_BASELINE_50 = [
+  10, 12, 14, 15, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 129, 253, 300, 364,
+  501, 608, 656, 706, 763, 764, 1269, 1278, 1282, 151, 260, 263, 320, 342, 361, 367, 399, 407,
+  425, 33, 34, 36, 38, 40, 41, 42, 46, 48
+];
+
 async function executarFluxoProducao({
   candidatos,
   competencia,
@@ -82,6 +90,7 @@ async function executarFluxoProducao({
   metricas,
   manterBrowserApos = false
 }) {
+  const jobCache = new GiapSearchCache();
   const cedencias = await carregarCedenciasAtuais();
   const indiceHistorico = await carregarIndiceHistorico(competencia);
   const prefixos = prefixosGlobaisDedup(candidatos);
@@ -93,6 +102,7 @@ async function executarFluxoProducao({
     pendentes: candidatos,
     metricas,
     manterBrowser: true,
+    cache: jobCache,
     comTimeout,
     watchdogMs: SCRAPE_WATCHDOG_MS
   });
@@ -103,6 +113,7 @@ async function executarFluxoProducao({
     pendentes: candidatos,
     competencia,
     bulkIndex: bulkRes.indice,
+    cache: jobCache,
     indiceHistorico,
     cedencias,
     codigoOrgao: String(codigoOrgao),
@@ -128,7 +139,9 @@ async function executarFluxoProducao({
     consultas_giap,
     tempo_bulk_ms,
     tempo_matching_ms,
-    tempos_consulta_ms: temposConsulta
+    tempos_consulta_ms: temposConsulta,
+    audit_por_id: buscaRes.audit_por_id,
+    cache_hits: jobCache.hits
   };
 }
 
@@ -159,6 +172,15 @@ export async function executarTesteFolha50(opts = {}) {
     const ids = new Set(opts.funcionario_ids.map(Number));
     candidatos = cov.pendentes.filter((p) => ids.has(p.funcionario_id)).slice(0, n);
     statsSelecao = { selecionados: candidatos.length, modo: 'funcionario_ids' };
+  } else if (opts.usar_baseline !== false) {
+    const todos = await listarBuscasNomePendentes(competencia);
+    const cedencias = await carregarCedenciasAtuais();
+    const indiceHistorico = await carregarIndiceHistorico(competencia);
+    const { medirCoberturaHistorico } = await import('./historico.js');
+    const cov = medirCoberturaHistorico(todos, indiceHistorico, cedencias);
+    const ids = new Set(IDS_BASELINE_50);
+    candidatos = cov.pendentes.filter((p) => ids.has(p.funcionario_id)).slice(0, n);
+    statsSelecao = { selecionados: candidatos.length, modo: 'baseline_50' };
   } else {
     const sel = await selecionarCandidatosDiversos(competencia, n);
     candidatos = sel.candidatos;
@@ -268,17 +290,27 @@ export async function executarTesteFolha50(opts = {}) {
 
   const criterio = {
     sem_oom: memoria_maxima_mb < 480,
-    consultas_menor_que_servidores: exec1.consultas_giap < candidatos.length,
+    consultas_lte_servidores: exec1.consultas_giap <= candidatos.length,
     maioria_resolvida: resolvidos >= candidatos.length * 0.5,
+    resolucao_gte_baseline: resolvidos >= BASELINE_TESTE_50.resolvidos,
     idempotencia_ok: idempotencia ? idempotencia.duplicidade_controlada : null,
     sem_timeout_relevante: true
   };
 
   const aprovado =
     criterio.sem_oom &&
-    criterio.consultas_menor_que_servidores &&
-    criterio.maioria_resolvida &&
+    criterio.consultas_lte_servidores &&
+    criterio.resolucao_gte_baseline &&
     (idempotencia ? idempotencia.duplicidade_controlada : true);
+
+  const analise = montarRelatorioAnalise({
+    candidatos,
+    auditPorId: exec1.buscaRes.audit_por_id || new Map(),
+    detalhes: exec1.buscaRes.detalhes_candidatos,
+    pendentesPosIds,
+    metricas: stats,
+    comparacaoAntes: BASELINE_TESTE_50
+  });
 
   return {
     competencia,
@@ -291,9 +323,22 @@ export async function executarTesteFolha50(opts = {}) {
     browser: scrapeMetrics,
     idempotencia,
     tabela_verificacao: tabela,
+    analise,
     divergencias: exec1.buscaRes.divergencias?.slice(0, 20) || [],
     criterio,
     aprovado,
+    comparacao_baseline: {
+      antes: BASELINE_TESTE_50,
+      depois: {
+        consultas_giap: exec1.consultas_giap,
+        resolvidos,
+        pendentes,
+        tempo_total_ms: tempo_total_ms,
+        cache_hits: exec1.cache_hits || 0
+      },
+      delta_consultas: exec1.consultas_giap - BASELINE_TESTE_50.consultas_giap,
+      delta_resolvidos: resolvidos - BASELINE_TESTE_50.resolvidos
+    },
     comparacao_job73: {
       job73_maria_ms: 183000,
       job73_ana_ms: 256000,

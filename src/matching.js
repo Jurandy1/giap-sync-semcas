@@ -27,6 +27,38 @@ export const CLASSIFICACAO = {
   SEM_MATCH: 'SEM_MATCH'
 };
 
+export function nomeGiapTemPrefixo(nomeGiap, termo) {
+  const n = normalizarNomeGiap(nomeGiap) || '';
+  const t = normalizarNomeGiap(termo) || String(termo || '').trim().toUpperCase();
+  if (!t) return false;
+  return n.startsWith(t);
+}
+
+export function chaveConsultaGiap(termo, org) {
+  const t = normalizarNomeGiap(termo) || String(termo || '').trim().toUpperCase();
+  return `${t}|org:${org ?? ''}`;
+}
+
+/** Mapa prefixo → quantos candidatos RH cobre (peso por especificidade). */
+export function calcularCoberturaPrefixos(pendentes) {
+  const freq = new Map();
+  const add = (prefix, peso = 1) => {
+    const v = String(prefix || '').trim().toUpperCase();
+    if (v.length >= 3) freq.set(v, (freq.get(v) || 0) + peso);
+  };
+  for (const p of pendentes || []) {
+    const nomeBase = p.historico?.funcionario || p.nome;
+    const sig = tokensSignificativos(nomeBase);
+    if (!sig.length) continue;
+    add(sig[0], 3);
+    if (sig.length >= 2) add([sig[0], sig[1]].join(' '), 2);
+    if (sig.length >= 3) add(sig.slice(0, 3).join(' '), 1);
+  }
+  return [...freq.entries()]
+    .sort((a, b) => b[1] - a[1] || b[0].length - a[0].length)
+    .map(([prefixo, candidatos_rh]) => ({ prefixo, candidatos_rh }));
+}
+
 export function maxVariantesNome() {
   return Math.max(1, Number(process.env.GIAP_MAX_VARIANTES_NOME || 4));
 }
@@ -381,6 +413,8 @@ export class GiapBulkIndex {
   constructor() {
     this.itens = [];
     this.porMat = new Map();
+    this.porCpf = new Map();
+    this.porNomeNorm = new Map();
     this.porPrimeiroToken = new Map();
   }
 
@@ -402,12 +436,34 @@ export class GiapBulkIndex {
         if (!this.porMat.has(mk)) this.porMat.set(mk, []);
         this.porMat.get(mk).push(item);
       }
+      const cpf = normalizarCPF(item.cpf);
+      if (cpf) {
+        if (!this.porCpf.has(cpf)) this.porCpf.set(cpf, []);
+        this.porCpf.get(cpf).push(item);
+      }
+      const nn = normalizarNomeGiap(item.funcionario);
+      if (nn) {
+        if (!this.porNomeNorm.has(nn)) this.porNomeNorm.set(nn, []);
+        this.porNomeNorm.get(nn).push(item);
+      }
       const ft = tokensSignificativos(item.funcionario)[0];
       if (ft) {
         if (!this.porPrimeiroToken.has(ft)) this.porPrimeiroToken.set(ft, []);
         this.porPrimeiroToken.get(ft).push(item);
       }
     }
+  }
+
+  /** GIAP usa prefixo startsWith — filtra itens já indexados. */
+  filtrarPorPrefixoGiap(termo, codigoOrgao = null) {
+    const t = normalizarNomeGiap(termo) || String(termo || '').trim().toUpperCase();
+    if (!t) return [];
+    return this.itens.filter((item) => {
+      if (codigoOrgao != null && codigoOrgao !== '' && String(item.codigo_orgao ?? '') !== String(codigoOrgao)) {
+        return false;
+      }
+      return nomeGiapTemPrefixo(item.funcionario, t);
+    });
   }
 
   candidatosPara(pendente) {
@@ -420,8 +476,24 @@ export class GiapBulkIndex {
     if (pendente.matricula) {
       for (const item of this.porMat.get(matKey(pendente.matricula)) || []) add(item);
     }
+    if (pendente.cpf) {
+      const cpf = normalizarCPF(pendente.cpf);
+      for (const item of this.porCpf.get(cpf) || []) add(item);
+    }
     if (pendente.historico?.matricula) {
       for (const item of this.porMat.get(matKey(pendente.historico.matricula)) || []) add(item);
+    }
+    if (pendente.historico?.cpf) {
+      const cpfH = normalizarCPF(pendente.historico.cpf);
+      for (const item of this.porCpf.get(cpfH) || []) add(item);
+    }
+    if (pendente.historico?.funcionario) {
+      const nh = normalizarNomeGiap(pendente.historico.funcionario);
+      for (const item of this.porNomeNorm.get(nh) || []) add(item);
+    }
+    const nn = normalizarNomeGiap(pendente.nome);
+    if (nn) {
+      for (const item of this.porNomeNorm.get(nn) || []) add(item);
     }
     const ft = tokensSignificativos(pendente.nome)[0];
     if (ft) {
@@ -438,10 +510,51 @@ export class GiapBulkIndex {
 export class GiapSearchCache {
   constructor() {
     this.porTermo = new Map();
+    this.vazios = new Set();
     this.resolvidos = new Set();
     this.hits = 0;
   }
 
+  getConsulta(termo, org) {
+    const k = chaveConsultaGiap(termo, org);
+    const hit = this.porTermo.get(k);
+    if (hit) this.hits++;
+    return hit || null;
+  }
+
+  setConsulta(termo, org, payload) {
+    const k = chaveConsultaGiap(termo, org);
+    this.porTermo.set(k, payload);
+    if (payload?.data?.length) this.vazios.delete(k);
+  }
+
+  marcarConsultaVazia(termo, org) {
+    this.vazios.add(chaveConsultaGiap(termo, org));
+  }
+
+  consultaVazia(termo, org) {
+    return this.vazios.has(chaveConsultaGiap(termo, org));
+  }
+
+  /** Filtra resultado de prefixo mais curto já em cache (ex: MARIA → MARIA SILVA). */
+  filtrarDePrefixoPai(termo, org) {
+    const t = normalizarNomeGiap(termo) || String(termo || '').trim().toUpperCase();
+    if (!t) return null;
+    let melhor = null;
+    for (const [key, val] of this.porTermo.entries()) {
+      if (!key.endsWith(`|org:${org ?? ''}`)) continue;
+      const prefix = key.slice(0, key.indexOf('|org:'));
+      if (prefix.length >= t.length || !t.startsWith(prefix)) continue;
+      const data = (val.data || []).filter((item) => nomeGiapTemPrefixo(item.funcionario, t));
+      if (!data.length && (val.data || []).length > 0) continue;
+      if (!melhor || prefix.length > melhor.prefixLen) {
+        melhor = { data, origem: `cache_filtro:${prefix}`, prefixLen: prefix.length };
+      }
+    }
+    return melhor;
+  }
+
+  /** @deprecated use getConsulta */
   get(termo) {
     const k = normalizarNomeGiap(termo) || String(termo || '').trim().toUpperCase();
     const hit = this.porTermo.get(k);
@@ -449,6 +562,7 @@ export class GiapSearchCache {
     return hit || null;
   }
 
+  /** @deprecated use setConsulta */
   set(termo, payload) {
     const k = normalizarNomeGiap(termo) || String(termo || '').trim().toUpperCase();
     this.porTermo.set(k, payload);
