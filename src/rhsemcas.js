@@ -636,6 +636,56 @@ export async function listarBuscasNomePendentes(competencia) {
   return buscas;
 }
 
+/**
+ * Carrega candidatos fixos por ID (teste A/B) — inclui já resolvidos na folha.
+ */
+export async function carregarCandidatosPorIds(competencia, ids) {
+  const idList = [...new Set(ids.map(Number))];
+  const cedencias = await carregarCedenciasAtuais();
+  const indiceHistorico = await carregarIndiceHistorico(competencia);
+
+  const funcs = await selectTudo(() =>
+    sb()
+      .from('funcionarios')
+      .select('id, nome, matricula, cpf, data_admissao')
+      .eq('ativo', true)
+      .in('id', idList)
+  );
+
+  const buscas = [];
+  for (const hr of funcs || []) {
+    const temMatricula = !matriculaVazia(hr.matricula);
+    const variantes = estrategiasBuscaProgressiva(hr.nome);
+    buscas.push({
+      funcionario_id: hr.id,
+      nome: hr.nome,
+      matricula: temMatricula ? String(hr.matricula).trim() : null,
+      cpf: hr.cpf ? normalizarCPF(hr.cpf) : null,
+      tem_matricula: temMatricula,
+      busca: variantes[0] || hr.nome,
+      variantes: variantes.length ? variantes : [hr.nome],
+      data_admissao: hr.data_admissao
+    });
+  }
+
+  const { pendentes } = medirCoberturaHistorico(buscas, indiceHistorico, cedencias);
+  const porId = new Map(pendentes.map((p) => [p.funcionario_id, p]));
+  return idList.map((id) => porId.get(id)).filter(Boolean);
+}
+
+/** Quantos candidatos já constam na folha da competência (por matrícula ou nome). */
+export async function contarCandidatosNaFolha(candidatos, competencia) {
+  const folha = await carregarFolhaCompetencia(competencia);
+  const matsFolha = new Set(folha.map((f) => String(f.matricula ?? '').trim()).filter(Boolean));
+  const nomesFolha = new Set(folha.map((f) => normalizarNome(f.funcionario)).filter(Boolean));
+  const naFolha = candidatos.filter(
+    (c) =>
+      (c.matricula && matsFolha.has(String(c.matricula).trim())) ||
+      nomesFolha.has(normalizarNome(c.nome))
+  );
+  return { resolvidos: naFolha.length, pendentes: candidatos.length - naFolha.length, ids_resolvidos: naFolha.map((c) => c.funcionario_id) };
+}
+
 /** CPF mascarado para relatórios (nunca expor completo). */
 export function mascararCpf(cpf) {
   const d = String(cpf || '').replace(/\D/g, '');

@@ -12,9 +12,12 @@ import {
   carregarCedenciasAtuais,
   listarBuscasNomePendentes,
   selecionarCandidatosDiversos,
+  carregarCandidatosPorIds,
+  contarCandidatosNaFolha,
   mascararCpf
 } from './rhsemcas.js';
 import { closeBrowser, getScrapeMetrics } from './scraper.js';
+import { normalizarNome } from './utils.js';
 
 const SCRAPE_WATCHDOG_MS = Math.max(
   35000,
@@ -56,7 +59,7 @@ function montarTabelaVerificacao(candidatos, detalhes, pendentesPosIds) {
   const porId = new Map((detalhes || []).map((d) => [d.funcionario_id, d]));
   return candidatos.map((c) => {
     const d = porId.get(c.funcionario_id);
-    const resolvido = !pendentesPosIds.has(c.funcionario_id);
+    const resolvido = idsResolvidosFolha.has(c.funcionario_id);
     return {
       funcionario_id: c.funcionario_id,
       nome_rh: c.nome,
@@ -173,14 +176,8 @@ export async function executarTesteFolha50(opts = {}) {
     candidatos = cov.pendentes.filter((p) => ids.has(p.funcionario_id)).slice(0, n);
     statsSelecao = { selecionados: candidatos.length, modo: 'funcionario_ids' };
   } else if (opts.usar_baseline !== false) {
-    const todos = await listarBuscasNomePendentes(competencia);
-    const cedencias = await carregarCedenciasAtuais();
-    const indiceHistorico = await carregarIndiceHistorico(competencia);
-    const { medirCoberturaHistorico } = await import('./historico.js');
-    const cov = medirCoberturaHistorico(todos, indiceHistorico, cedencias);
-    const ids = new Set(IDS_BASELINE_50);
-    candidatos = cov.pendentes.filter((p) => ids.has(p.funcionario_id)).slice(0, n);
-    statsSelecao = { selecionados: candidatos.length, modo: 'baseline_50' };
+    candidatos = await carregarCandidatosPorIds(competencia, IDS_BASELINE_50.slice(0, n));
+    statsSelecao = { selecionados: candidatos.length, modo: 'baseline_50_fixo', ids: IDS_BASELINE_50.slice(0, n) };
   } else {
     const sel = await selecionarCandidatosDiversos(competencia, n);
     candidatos = sel.candidatos;
@@ -188,15 +185,19 @@ export async function executarTesteFolha50(opts = {}) {
   }
 
   if (!candidatos.length) {
-    throw new Error('Nenhum candidato pendente encontrado para o teste.');
+    throw new Error('Nenhum candidato encontrado para o teste.');
   }
+
+  const statusFolhaPre = await contarCandidatosNaFolha(candidatos, competencia);
+  const idsJaNaFolha = new Set(statusFolhaPre.ids_resolvidos);
+  const candidatosProcessar = candidatos.filter((c) => !idsJaNaFolha.has(c.funcionario_id));
 
   const folhaAntes = await contarFolhaBulk(competencia, codigoOrgao);
 
   const metricas = criarMetricas('teste-folha-50', competencia);
 
   const exec1 = await executarFluxoProducao({
-    candidatos,
+    candidatos: candidatosProcessar.length ? candidatosProcessar : candidatos,
     competencia,
     codigoOrgao,
     metricas,
@@ -209,9 +210,11 @@ export async function executarTesteFolha50(opts = {}) {
   const pendentesPosIds = new Set(pendentesPos.map((p) => p.funcionario_id));
   const idsCandidatos = new Set(candidatos.map((c) => c.funcionario_id));
 
+  const folhaCompRes = await contarCandidatosNaFolha(candidatos, competencia);
   const matches = exec1.buscaRes.resultados.length;
-  const resolvidos = candidatos.filter((c) => !pendentesPosIds.has(c.funcionario_id)).length;
-  const pendentes = candidatos.filter((c) => pendentesPosIds.has(c.funcionario_id)).length;
+  const resolvidos = folhaCompRes.resolvidos;
+  const pendentes = folhaCompRes.pendentes;
+  const idsResolvidosFolha = new Set(folhaCompRes.ids_resolvidos);
 
   const tabela = montarTabelaVerificacao(
     candidatos,
@@ -315,7 +318,7 @@ export async function executarTesteFolha50(opts = {}) {
   return {
     competencia,
     codigo_orgao: codigoOrgao,
-    selecao: statsSelecao,
+    selecao: { ...statsSelecao, ja_na_folha: statusFolhaPre.resolvidos, a_processar: candidatosProcessar.length },
     candidatos: candidatos.length,
     ids_candidatos: [...idsCandidatos],
     metricas: stats,
