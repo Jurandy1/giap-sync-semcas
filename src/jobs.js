@@ -224,6 +224,18 @@ export function iniciarWatchdogCadeias() {
 }
 
 /**
+ * Trava em memória por competência: agendarProximoLote (fire-and-forget logo
+ * após um lote terminar) e o watchdog de retomada podem disparar quase ao
+ * mesmo instante pra mesma competência. Sem isso, os dois passam pelo SELECT
+ * "tem job ativo?" antes de qualquer um ter inserido a linha, e cada um cria
+ * o seu — dois scrapes/Chrome concorrentes na mesma competência (visto em
+ * produção: jobs #123 e #124 rodando juntos pra 202608). Só protege dentro
+ * do mesmo processo Node; não substitui um lock no banco se um dia houver
+ * mais de uma instância do serviço rodando ao mesmo tempo.
+ */
+const competenciasEmCriacao = new Set();
+
+/**
  * Cria job e processa em background.
  */
 export async function criarEExecutarJob({
@@ -242,64 +254,85 @@ export async function criarEExecutarJob({
     resetCadeiaContinua();
   }
 
-  // Evita dois jobs concorrentes na mesma competência (sync folha)
-  if (limparOrfaos !== false && modo !== 'continuar' && TIPOS_SYNC_FOLHA.includes(tipo)) {
-    const { data: ativo } = await sb()
-      .from('giap_jobs')
-      .select('*')
-      .eq('competencia', comp)
-      .in('tipo', TIPOS_SYNC_FOLHA)
-      .in('status', ['pending', 'running'])
-      .order('id', { ascending: false })
-      .limit(1);
-    if (ativo?.length) {
-      console.log(
-        '[jobs] job ativo para competência',
-        comp,
-        '— retorna existente #',
-        ativo[0].id
-      );
-      return ativo[0];
+  const ehSyncFolha = TIPOS_SYNC_FOLHA.includes(tipo);
+  if (ehSyncFolha) {
+    while (competenciasEmCriacao.has(comp)) {
+      await new Promise((r) => setTimeout(r, 200));
     }
+    competenciasEmCriacao.add(comp);
   }
 
-  // Jobs órfãos (Render OOM/restart) ficam "running" — cancela ao iniciar outro
-  // (em lotes de continuação não limpa: o job anterior já está "done")
-  if (limparOrfaos !== false) {
-    await limparJobsOrfaos('Interrompido ou substituído por novo job (serviço reiniciou/OOM).');
-  }
+  try {
+    // Evita dois jobs concorrentes na mesma competência (sync folha). Roda
+    // sempre pra esse tipo — inclusive em modo='continuar' e com
+    // limparOrfaos=false (é exatamente o caso do agendarProximoLote e do
+    // watchdog) — porque agora dois caminhos independentes podem chamar
+    // isso pra mesma competência quase ao mesmo tempo; só o lock acima
+    // garante que essa checagem e o INSERT abaixo aconteçam como uma
+    // unidade só. limparOrfaos continua controlando só o limparJobsOrfaos()
+    // global logo abaixo (esse sim tem que ficar de fora de continuações,
+    // senão uma cadeia rápida numa competência derruba o job "running"
+    // de outra competência que esteja encadeando ao mesmo tempo).
+    if (ehSyncFolha) {
+      const { data: ativo } = await sb()
+        .from('giap_jobs')
+        .select('*')
+        .eq('competencia', comp)
+        .in('tipo', TIPOS_SYNC_FOLHA)
+        .in('status', ['pending', 'running'])
+        .order('id', { ascending: false })
+        .limit(1);
+      if (ativo?.length) {
+        console.log(
+          '[jobs] job ativo para competência',
+          comp,
+          '— retorna existente #',
+          ativo[0].id
+        );
+        return ativo[0];
+      }
+    }
 
-  const { data: job, error } = await sb()
-    .from('giap_jobs')
-    .insert({
+    // Jobs órfãos (Render OOM/restart) ficam "running" — cancela ao iniciar outro
+    // (em lotes de continuação não limpa: o job anterior já está "done")
+    if (limparOrfaos !== false) {
+      await limparJobsOrfaos('Interrompido ou substituído por novo job (serviço reiniciou/OOM).');
+    }
+
+    const { data: job, error } = await sb()
+      .from('giap_jobs')
+      .insert({
+        tipo,
+        status: 'pending',
+        modo,
+        competencia: comp,
+        dry_run: !!dryRun,
+        progresso_pct: 0,
+        total: 0,
+        processados: 0,
+        resumo: { filtros: filtros || {} },
+        created_by: createdBy
+      })
+      .select('*')
+      .single();
+
+    if (error) throw error;
+
+    const promise = executarJob(job.id, {
       tipo,
-      status: 'pending',
-      modo,
       competencia: comp,
-      dry_run: !!dryRun,
-      progresso_pct: 0,
-      total: 0,
-      processados: 0,
-      resumo: { filtros: filtros || {} },
-      created_by: createdBy
-    })
-    .select('*')
-    .single();
+      dryRun,
+      codigoOrgao,
+      filtros: filtros || {}
+    }).catch((e) => {
+      console.error('[jobs] falha', job.id, e);
+    });
+    running.set(job.id, promise);
 
-  if (error) throw error;
-
-  const promise = executarJob(job.id, {
-    tipo,
-    competencia: comp,
-    dryRun,
-    codigoOrgao,
-    filtros: filtros || {}
-  }).catch((e) => {
-    console.error('[jobs] falha', job.id, e);
-  });
-  running.set(job.id, promise);
-
-  return job;
+    return job;
+  } finally {
+    if (ehSyncFolha) competenciasEmCriacao.delete(comp);
+  }
 }
 
 /**
