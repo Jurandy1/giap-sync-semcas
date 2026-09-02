@@ -158,7 +158,7 @@ export function estrategiaHistoricoPrincipal(historico) {
   return sig[0] || null;
 }
 
-/** Estratégias iniciais — histórico específico primeiro; Grupo A = 1 tentativa. */
+/** Estratégias iniciais — histórico específico primeiro; depois nome RH progressivo. */
 export function estrategiasComHistorico(pendente, historico) {
   const out = [];
   const add = (s) => {
@@ -169,14 +169,15 @@ export function estrategiasComHistorico(pendente, historico) {
   const principal = estrategiaHistoricoPrincipal(historico);
   if (principal) add(principal);
 
-  if (historicoEhConfiavel(historico)) {
-    return out.slice(0, 1);
-  }
-
   for (const e of estrategiasBuscaProgressiva(pendente.nome, maxVariantesNome())) {
     add(e);
   }
-  return out.slice(0, maxVariantesNome());
+
+  // Grupo A: histórico primeiro, mas o portal muitas vezes só acha com nome completo.
+  const limit = historicoEhConfiavel(historico)
+    ? 1 + maxVariantesNome()
+    : maxVariantesNome();
+  return out.slice(0, limit);
 }
 
 /** Métricas de cobertura histórica para todos os pendentes. */
